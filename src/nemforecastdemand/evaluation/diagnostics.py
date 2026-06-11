@@ -65,7 +65,7 @@ def mcmc_summary(posterior: dict[str, np.ndarray]) -> pd.DataFrame:
         trailing dimensions reduced, so vector sites report their weakest
         element.
     """
-    idata = az.from_dict(posterior=posterior)
+    idata = az.from_dict({"posterior": posterior})
     rhat = az.rhat(idata)
     bulk = az.ess(idata, method="bulk")
     tail = az.ess(idata, method="tail")

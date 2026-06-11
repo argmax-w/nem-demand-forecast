@@ -112,6 +112,50 @@ def plot_clock_profile(
     ax.set_xlabel("hour of day")
 
 
+def fan_chart(
+    ax: plt.Axes,
+    index: pd.DatetimeIndex,
+    mean: np.ndarray | None = None,
+    sd: np.ndarray | None = None,
+    samples: np.ndarray | None = None,
+    levels: tuple[float, ...] = (0.5, 0.8, 0.95),
+    colour: str = _PALETTE["demand"],
+    label: str | None = None,
+) -> None:
+    """Draw central predictive bands and the median over a horizon.
+
+    Accepts either a Gaussian predictive (``mean`` and ``sd``) or predictive
+    ``samples`` of shape ``(S, T)``; bands are exact quantiles either way.
+    """
+    from scipy import stats
+
+    times = display_index(index)
+    for level in sorted(levels, reverse=True):
+        tail = (1.0 - level) / 2.0
+        if samples is not None:
+            lower = np.quantile(samples, tail, axis=0)
+            upper = np.quantile(samples, 1.0 - tail, axis=0)
+        else:
+            z = stats.norm.ppf(1.0 - tail)
+            lower, upper = mean - z * sd, mean + z * sd
+        ax.fill_between(times, lower, upper, color=colour, alpha=0.18, lw=0)
+    centre = np.median(samples, axis=0) if samples is not None else mean
+    ax.plot(times, centre, color=colour, lw=1.4, label=label)
+    format_date_axis(ax)
+
+
+def horizon_curve(
+    ax: plt.Axes,
+    scores: np.ndarray,
+    label: str,
+    colour: str,
+) -> None:
+    """Mean score by forecast step, from per-origin scores ``(O, H)``."""
+    steps = (np.arange(scores.shape[1]) + 1) / 2.0
+    ax.plot(steps, scores.mean(axis=0), color=colour, label=label)
+    ax.set_xlabel("lead time (hours)")
+
+
 def save_figure(fig: plt.Figure, name: str, figures_dir: Path) -> Path:
     """Save a figure for the README, returning its path."""
     figures_dir.mkdir(parents=True, exist_ok=True)
