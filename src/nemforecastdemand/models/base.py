@@ -37,9 +37,11 @@ WEATHER_SOURCES = {"actual": "", "forecast": "_fc"}
 class Forecast:
     """One probabilistic forecast: 48 half hours from a single origin.
 
-    Exactly one of ``sd`` (Gaussian predictive) or ``samples`` (draws from
-    the posterior predictive) is set, matching the classical and Bayesian
-    forecast representations.
+    Exactly one distributional representation is set: ``sd`` (Gaussian
+    predictive, the classical models), ``samples`` (posterior predictive
+    draws, the Bayesian models) or ``quantile_values`` with their levels
+    (the gradient-boosted quantile heads). ``mean`` is the point forecast,
+    the predictive median for quantile forecasters.
     """
 
     origin: pd.Timestamp
@@ -47,6 +49,8 @@ class Forecast:
     mean: np.ndarray
     sd: np.ndarray | None = None
     samples: np.ndarray | None = None
+    quantile_levels: np.ndarray | None = None
+    quantile_values: np.ndarray | None = None
 
 
 def weather_columns(panel: pd.DataFrame, source: str) -> pd.DataFrame:

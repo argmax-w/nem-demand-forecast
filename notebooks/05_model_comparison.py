@@ -1,15 +1,18 @@
 # %% [markdown]
 # # 05. Model comparison: one model, two inference algorithms, one baseline
 #
-# Headline results. Three probabilistic forecasters of NSW1 operational
-# demand are compared on identical test origins (112 of them: 00:00 and
-# 12:00 AEST daily across eight weeks), identical features and identical
-# weather-input variants:
+# Headline results. Four model families forecast NSW1 operational demand
+# on identical test origins (two per day, 00:00 and 12:00 AEST, across
+# eight weeks), identical features and identical weather-input variants:
 #
 # - **Seasonal naive**: same half hour last week, with an honest Gaussian
 #   band. The floor every model must clear.
 # - **Dynamic harmonic regression with ARIMA errors**: the classical
 #   baseline, analytic Gaussian predictive.
+# - **LightGBM quantile regression**: the industry tabular benchmark,
+#   fifteen pinball-objective heads on the same design, trained on the full
+#   training split (the time-series models deliberately use a recent
+#   window; each model is run the way a practitioner would run it).
 # - **One BSTS, three posteriors**: the structural model of notebooks 03
 #   and 04 fitted by mean-field ADVI, full-rank ADVI and NUTS. Same model,
 #   same priors, same data; the inference algorithm is the only difference.
@@ -17,9 +20,12 @@
 # Scores: CRPS (primary), log score, pinball loss, MAE, MASE, central
 # coverage, PIT calibration and the energy score over whole 48-step paths.
 # Sample-based scores use the energy-form estimator, unit-tested against
-# the analytic Gaussian form; the energy score needs jointly coherent
-# sampled paths and is therefore reported for the Bayesian models only
-# (the classical artifacts store marginal predictives).
+# the analytic Gaussian form. Representation differences are respected
+# rather than papered over: the energy score needs jointly coherent sampled
+# paths, so it exists for the Bayesian models only; LightGBM's CRPS uses
+# the quantile-integral estimator (also unit-tested against the Gaussian
+# form), its point forecast is the median head and its log score is
+# unavailable; its PIT comes from interpolating the quantile function.
 
 # %%
 import matplotlib.pyplot as plt
@@ -53,17 +59,27 @@ panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 nuts, nuts_meta = load_artifact(cfg.paths.artifacts / "bsts_nuts_cold")
+gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
 vi = {k: load_artifact(cfg.paths.artifacts / f"bsts_vi_{k}") for k in ("meanfield", "fullrank")}
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
 )
 y_test = nuts["y_test"]
 quantile_levels = np.array(cfg.evaluation.quantiles)
+gbdt_levels = np.array(gbdt_meta["quantile_levels"])
 
-MODELS = ["seasonal naive", "ARIMA", "BSTS ADVI mean-field", "BSTS ADVI full-rank", "BSTS NUTS"]
+MODELS = [
+    "seasonal naive",
+    "ARIMA",
+    "LightGBM",
+    "BSTS ADVI mean-field",
+    "BSTS ADVI full-rank",
+    "BSTS NUTS",
+]
 COLOURS = {
     "seasonal naive": "#9a9a9a",
     "ARIMA": palette("forecast"),
+    "LightGBM": "#2e7d32",
     "BSTS ADVI mean-field": palette("demand"),
     "BSTS ADVI full-rank": palette("accent"),
     "BSTS NUTS": "black",
@@ -133,9 +149,51 @@ def sample_scores(paths: np.ndarray) -> dict:
     }
 
 
+def quantile_scores(quantile_paths: np.ndarray) -> dict:
+    """Scores for the quantile-head forecaster, shape ``(O, Q, H)``."""
+    from nemforecastdemand.evaluation.metrics import crps_from_quantiles
+
+    n_origins = y_test.shape[0]
+    crps = np.stack(
+        [crps_from_quantiles(y_test[i], quantile_paths[i], gbdt_levels) for i in range(n_origins)]
+    )
+    median = quantile_paths[:, gbdt_levels.tolist().index(0.5), :]
+    report_idx = [gbdt_levels.tolist().index(q) for q in quantile_levels]
+    cover = {}
+    for level in cfg.evaluation.interval_levels:
+        lower = quantile_paths[:, gbdt_levels.tolist().index(round(0.5 - level / 2, 3)), :]
+        upper = quantile_paths[:, gbdt_levels.tolist().index(round(0.5 + level / 2, 3)), :]
+        cover[level] = interval_coverage(y_test.ravel(), lower.ravel(), upper.ravel())
+    # PIT by interpolating the discrete quantile function; observations
+    # outside the trained 2.5/97.5 band clamp to 0 or 1, an approximation
+    # visible only in the outer histogram bins.
+    pit = np.array(
+        [
+            np.interp(y_test[i, j], quantile_paths[i, :, j], gbdt_levels, left=0.0, right=1.0)
+            for i in range(n_origins)
+            for j in range(y_test.shape[1])
+        ]
+    )
+    return {
+        "per_origin_crps": crps.mean(axis=1),
+        "per_step_crps": crps,
+        "point": median,
+        "log_score": np.nan,
+        "pinball": pinball_loss(
+            y_test.ravel(),
+            quantile_paths[:, report_idx, :].transpose(1, 0, 2).reshape(len(quantile_levels), -1),
+            quantile_levels,
+        ).mean(),
+        "coverage": cover,
+        "energy": np.nan,
+        "pit": np.asarray(pit, dtype=np.float64),
+    }
+
+
 scores = {
     "seasonal naive": gaussian_scores(arima["naive_mean"], arima["naive_sd"]),
     "ARIMA": gaussian_scores(arima["forecast_mean"], arima["forecast_sd"]),
+    "LightGBM": quantile_scores(gbdt["forecast_quantiles"]),
     "BSTS ADVI mean-field": sample_scores(vi["meanfield"][0]["forecast_paths"]),
     "BSTS ADVI full-rank": sample_scores(vi["fullrank"][0]["forecast_paths"]),
     "BSTS NUTS": sample_scores(nuts["forecast_paths"]),
@@ -179,6 +237,8 @@ pairs = [
     ("BSTS ADVI mean-field", "ARIMA"),
     ("BSTS ADVI mean-field", "BSTS NUTS"),
     ("BSTS ADVI full-rank", "BSTS NUTS"),
+    ("LightGBM", "ARIMA"),
+    ("LightGBM", "BSTS NUTS"),
     ("ARIMA", "seasonal naive"),
 ]
 sig_rows = {}
@@ -193,7 +253,7 @@ pd.DataFrame(sig_rows).T.round(3)
 # ## Calibration
 
 # %%
-fig, axes = plt.subplots(1, 4, figsize=(13, 3), sharey=True)
+fig, axes = plt.subplots(1, len(MODELS) - 1, figsize=(15, 3), sharey=True)
 for ax, name in zip(axes, MODELS[1:], strict=True):
     density, edges = pit_histogram(scores[name]["pit"], bins=20)
     ax.bar(edges[:-1], density, width=np.diff(edges), align="edge", color=COLOURS[name], alpha=0.85)
@@ -231,6 +291,8 @@ sweep_x = [0.0] + [m for m in cfg.perturbation.sweep_multipliers if m > 0]
 
 
 def sweep_crps(name: str) -> list[float]:
+    from nemforecastdemand.evaluation.metrics import crps_from_quantiles
+
     out = []
     for m in sweep_x:
         variant = "actual" if m == 0 else f"perturb_{m:g}"
@@ -238,6 +300,18 @@ def sweep_crps(name: str) -> list[float]:
             out.append(
                 float(
                     crps_gaussian(y_test, arima[f"{variant}_mean"], arima[f"{variant}_sd"]).mean()
+                )
+            )
+        elif name == "LightGBM":
+            paths = gbdt[f"{variant}_quantiles"]
+            out.append(
+                float(
+                    np.mean(
+                        [
+                            crps_from_quantiles(y_test[i], paths[i], gbdt_levels).mean()
+                            for i in range(y_test.shape[0])
+                        ]
+                    )
                 )
             )
         else:
@@ -333,6 +407,10 @@ compute_rows = {
     "ARIMA": {
         "fit (s)": arima_meta["timings_seconds"]["final_fit"],
         "forecast all origins (s)": arima_meta["timings_seconds"]["test_forecasts"],
+    },
+    "LightGBM": {
+        "fit (s)": gbdt_meta["timings_seconds"]["fit"],
+        "forecast all origins (s)": gbdt_meta["timings_seconds"]["test_forecasts"],
     },
     "BSTS ADVI mean-field": {
         "fit (s)": vi["meanfield"][1]["timings_seconds"]["fit_seconds"],

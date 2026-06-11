@@ -11,6 +11,7 @@ from nemforecastdemand.evaluation.calibration import (
 )
 from nemforecastdemand.evaluation.diagnostics import ElboTrace, sampler_health, time_to_target_ess
 from nemforecastdemand.evaluation.metrics import (
+    crps_from_quantiles,
     crps_gaussian,
     crps_samples,
     energy_score,
@@ -55,6 +56,19 @@ def test_energy_score_reduces_to_crps_in_one_dimension():
     es = energy_score(y, draws, chunk=512)
     crps = crps_samples(y, draws, chunk=512)[0]
     np.testing.assert_allclose(es, crps, rtol=1e-10)
+
+
+def test_crps_from_quantiles_matches_analytic_gaussian():
+    from nemforecastdemand.models.gbdt import QUANTILE_LEVELS
+
+    levels = np.array(QUANTILE_LEVELS)
+    mean = np.array([0.0, 5.0, -2.0])
+    sd = np.array([1.0, 2.0, 0.5])
+    y = np.array([0.4, 3.0, -2.1])
+    quantile_forecasts = mean[None] + stats.norm.ppf(levels)[:, None] * sd[None]
+    approx = crps_from_quantiles(y, quantile_forecasts, levels)
+    exact = crps_gaussian(y, mean, sd)
+    np.testing.assert_allclose(approx, exact, rtol=0.08)
 
 
 def test_pinball_median_is_half_mae():

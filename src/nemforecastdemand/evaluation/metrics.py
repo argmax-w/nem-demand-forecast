@@ -113,6 +113,40 @@ def energy_score(y: np.ndarray, draws: np.ndarray, chunk: int = 256) -> float:
     return error_term / n_draws - 0.5 * pair_term / (n_draws * n_draws)
 
 
+def crps_from_quantiles(
+    y: np.ndarray, quantile_forecasts: np.ndarray, quantiles: np.ndarray
+) -> np.ndarray:
+    """CRPS approximated from a grid of predictive quantiles.
+
+    Uses the identity CRPS = 2 integral of the pinball loss over quantile
+    levels, evaluated by the trapezoidal rule with the open tails closed at
+    levels 0 and 1 (where the pinball loss of any finite forecast tends to
+    zero). Used for quantile-only forecasters such as the gradient-boosted
+    benchmark; accuracy against the analytic Gaussian form is unit-tested.
+
+    Parameters
+    ----------
+    y
+        Observations, shape ``(T,)``.
+    quantile_forecasts
+        Forecast quantiles, shape ``(Q, T)``, non-crossing.
+    quantiles
+        The quantile levels, shape ``(Q,)``, increasing.
+
+    Returns
+    -------
+    numpy.ndarray
+        Approximate CRPS per step, shape ``(T,)``.
+    """
+    y = np.asarray(y)[None, :]
+    q = np.asarray(quantiles)[:, None]
+    diff = y - np.asarray(quantile_forecasts)
+    pinball = np.where(diff >= 0, q * diff, (q - 1.0) * diff)
+    levels = np.concatenate([[0.0], np.asarray(quantiles), [1.0]])
+    curve = np.vstack([np.zeros(y.shape[1]), pinball, np.zeros(y.shape[1])])
+    return 2.0 * np.trapezoid(curve, levels, axis=0)
+
+
 def log_score_gaussian(y: np.ndarray, mean: np.ndarray, sd: np.ndarray) -> np.ndarray:
     """Negative log predictive density of a Gaussian predictive."""
     return -stats.norm.logpdf(np.asarray(y), loc=mean, scale=sd)

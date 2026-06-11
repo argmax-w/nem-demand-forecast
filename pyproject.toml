@@ -22,6 +22,7 @@ dependencies = [
     "requests>=2.31",
     "pyyaml>=6.0",
     "holidays>=0.40",
+    "lightgbm>=4.3",
     "jax>=0.4.30",
     "numpyro>=0.15",
     "optax>=0.2",

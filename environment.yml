@@ -13,6 +13,7 @@ dependencies:
   - requests
   - pyyaml
   - holidays
+  - lightgbm
   - arviz
   - jupyterlab
   - jupytext
