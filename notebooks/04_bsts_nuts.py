@@ -133,7 +133,7 @@ plt.show()
 
 # %%
 rows = {}
-for site in compare_sites + ["level_init", "slope_init"]:
+for site in [*compare_sites, "level_init", "slope_init"]:
     nuts_sd = cold[f"post_{site}"].ravel().std()
     rows[site] = {
         "sd NUTS": nuts_sd,

@@ -86,7 +86,7 @@ test_origins = rolling_origins(
 # %%
 fig, axes = plt.subplots(1, 3, figsize=(13, 4))
 colours = {"meanfield": palette("demand"), "fullrank": palette("accent")}
-for kind, (arrays, meta) in fits.items():
+for kind, (arrays, _meta) in fits.items():
     axes[0].plot(arrays["elbo_steps"], arrays["elbo"], color=colours[kind], label=kind)
     axes[1].plot(arrays["elbo_steps"], arrays["energy"], color=colours[kind])
     axes[2].plot(arrays["elbo_steps"], arrays["entropy"], color=colours[kind])
@@ -172,7 +172,7 @@ fit_index = panel.index[panel.index < splits["test"].index[0]][-cfg.bsts.train_d
 inputs = bsts.prepare_inputs(panel, cfg, fit_index)
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for kind, (arrays, meta) in fits.items():
+for kind, (arrays, _meta) in fits.items():
     level_mw = arrays["level_mean"] * inputs.y_scale + inputs.y_loc
     band_lo = arrays["level_q05"] * inputs.y_scale + inputs.y_loc
     band_hi = arrays["level_q95"] * inputs.y_scale + inputs.y_loc
@@ -185,7 +185,7 @@ axes[0].legend()
 
 local_hour = fit_index.tz_convert("Australia/Sydney")
 hour_frac = local_hour.hour + local_hour.minute / 60
-for kind, (arrays, meta) in fits.items():
+for kind, (arrays, _meta) in fits.items():
     gamma0 = arrays["draw_gamma0"][:, None]
     gamma = arrays["draw_gamma"]
     log_sigma = gamma0 + gamma @ inputs.x_var.T
@@ -217,7 +217,7 @@ arima_arrays, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 y_test = fits["meanfield"][0]["y_test"]
 
 crps_rows = {}
-for kind, (arrays, meta) in fits.items():
+for kind, (arrays, _meta) in fits.items():
     per_origin = np.stack(
         [
             crps_samples(y_test[i], arrays["forecast_paths"][:, i, :]).mean()
