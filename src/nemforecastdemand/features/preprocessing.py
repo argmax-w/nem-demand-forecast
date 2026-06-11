@@ -135,10 +135,10 @@ def build_panel(
     for column in actuals:
         panel[column] = actuals[column]
 
-    forecast_stems = {
-        f"{name}_previous_day{cfg.weather.lead_days}": f"{stem.split('_')[0]}_fc_{stem.split('_', 1)[1]}"
-        for name, stem in VARIABLE_STEMS.items()
-    }
+    forecast_stems = {}
+    for name, stem in VARIABLE_STEMS.items():
+        head, tail = stem.split("_", 1)
+        forecast_stems[f"{name}_previous_day{cfg.weather.lead_days}"] = f"{head}_fc_{tail}"
     fc = forecast.rename(columns=forecast_stems)
     gaps_before = fc.isna().sum()
     fc = fc.interpolate(method="time", limit=8)

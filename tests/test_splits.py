@@ -40,7 +40,7 @@ def test_rolling_origins_respect_horizon_and_lags():
         max_lag=336,
     )
     market = origins.tz_convert(MARKET_TZ)
-    assert set(zip(market.hour, market.minute)) <= {(0, 0), (12, 0)}
+    assert set(zip(market.hour, market.minute, strict=True)) <= {(0, 0), (12, 0)}
     # Three test days support two half-day origins each, minus the final
     # 12:00 whose horizon would run past the end of the split.
     assert len(origins) == 5

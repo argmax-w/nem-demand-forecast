@@ -45,7 +45,7 @@ def test_local_phases_follow_sydney_clock_through_dst():
     winter = pd.DatetimeIndex([pd.Timestamp("2025-06-15 14:00", tz="UTC")])
     summer = pd.DatetimeIndex([pd.Timestamp("2026-01-15 13:00", tz="UTC")])
     for index in (winter, summer):
-        daily, weekly = local_phases(index)
+        daily, _ = local_phases(index)
         assert daily[0] == 0.0
     market_midnight_summer = pd.DatetimeIndex([pd.Timestamp("2026-01-15 14:00", tz="UTC")])
     daily, _ = local_phases(market_midnight_summer)

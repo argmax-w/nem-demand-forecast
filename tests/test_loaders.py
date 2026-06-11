@@ -3,9 +3,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+from tests.conftest import make_panel
 
 from nemforecastdemand.data.loaders import load_split, load_splits, validate_panel
-from tests.conftest import make_panel
 
 
 def test_valid_panel_passes(panel):
