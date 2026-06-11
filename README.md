@@ -9,23 +9,58 @@ calibration and computational cost.
 
 ## The comparison
 
-| Model | Inference | Predictive |
-| --- | --- | --- |
-| Seasonal naive | none | Gaussian band from weekly-naive errors |
-| Dynamic harmonic regression + ARIMA errors | maximum likelihood (SARIMAX) | analytic Gaussian |
-| BSTS | ADVI, mean-field (`AutoNormal`) | posterior predictive paths |
-| BSTS | ADVI, full-rank (`AutoMultivariateNormal`) | posterior predictive paths |
-| BSTS | NUTS, 4 chains (reference posterior) | posterior predictive paths |
+Every model sees the same design matrix (local-clock seasonal basis,
+temperature, dew point, direct and diffuse irradiance, degree days, demand
+lags, holidays) and is scored on identical rolling test origins under
+identical weather-input variants.
 
-Because the three Bayesian fits share one model, differences between them
-isolate the inference algorithm rather than confounding it with model
-choice. The BSTS is a stochastic local linear trend (damped slope) with
-static seasonal regression on local-clock Fourier phases, weather and
-lagged-demand regressors and a heteroskedastic log-linear observation
-scale, written as an explicit scan-based state-space model with non-centred
-innovations. Prediction is Rao-Blackwellised: conditional on hyperparameter
-draws the model is linear-Gaussian, so rolling-origin forecasts run a
-Kalman filter per draw and simulate jointly coherent 48-step paths.
+| Model | Training window | Predictive form | Role |
+| --- | --- | --- | --- |
+| Seasonal naive | 56 days | Gaussian band from weekly-naive errors | the floor and the MASE base |
+| Dynamic harmonic regression + ARIMA errors | 56 days | analytic Gaussian, homoskedastic | strong classical baseline |
+| LightGBM, 15 quantile heads | full year (and a 56-day ablation) | regularised quantiles | industry point-model foil |
+| BSTS, explicit states (~5,400 sampled dims) | 56 days | posterior predictive paths | the inference testbed |
+| BSTS, collapsed states (~53 sampled dims) | full year | posterior predictive paths | the production formulation |
+
+The BSTS is a stochastic local linear trend (damped slope) with static
+seasonal regression, weather and lagged-demand regressors and a
+heteroskedastic log-linear observation scale. It appears in two
+formulations of the same generative model. The **explicit** form samples
+the latent states (scan-based, non-centred innovations), which is the
+demanding inference exercise but caps the window: every half hour adds two
+latent dimensions. The **collapsed** form marginalises the states
+analytically through a Kalman filter inside the likelihood, so inference
+runs over roughly fifty hyperparameters regardless of data length and the
+full training year becomes tractable. Each formulation is fitted five
+ways: mean-field ADVI (`AutoNormal`), full-rank ADVI
+(`AutoMultivariateNormal`), cold NUTS (the reference posterior) and
+warm-started NUTS with chain positions and the frozen inverse mass matrix
+taken from each surrogate (diagonal from mean-field, dense from full-rank)
+over a grid of reduced warmups.
+
+Prediction is Rao-Blackwellised for every Bayesian fit: conditional on
+hyperparameter draws the model is linear-Gaussian, so rolling-origin
+forecasts run a Kalman filter per draw and simulate jointly coherent
+48-step paths, with no per-origin refitting.
+
+The axes of comparison, and where each is answered:
+
+1. **Inference algorithm at fixed model** (mean-field against full-rank
+   against NUTS): posterior fidelity on marginals and correlations,
+   predictive consequences, cost. Notebooks 03 and 04.
+2. **Warm-start economics**: cold total against ADVI fit plus reduced
+   warmup plus sampling, judged only at matched quality (target bulk ESS,
+   clean R-hat, no divergences). Notebook 04.
+3. **Dimension against data** (explicit 56 days against collapsed full
+   year): what a short window understates, and ESS per second when the
+   cost lives in dimensions rather than gradients. Notebook 04.
+4. **Model class** (Bayesian against classical against gradient-boosted
+   against naive): accuracy, calibration, joint-path coherence,
+   statistical significance and robustness to degrading weather inputs,
+   plus the LightGBM window ablation separating data quantity from model
+   class. Notebook 05.
+5. **Hardware**: GPU against 32 CPU cores at matched workloads, for both
+   formulations. Notebook 04.
 
 ## Task and data
 
@@ -86,8 +121,10 @@ python scripts/download_aemo.py      # NEMWeb weekly archives -> data/raw, data/
 python scripts/download_weather.py   # Open-Meteo ERA5 + previous-runs -> data/raw
 python scripts/build_dataset.py      # processed train/val/test parquet (committed)
 python scripts/fit_arima.py          # order selection + test forecasts -> artifacts/
-python scripts/fit_bsts_vi.py        # ADVI fits + forecasts -> artifacts/
-python scripts/fit_bsts_nuts.py      # NUTS cold + warm starts -> artifacts/
+python scripts/fit_gbdt.py           # LightGBM quantile heads + window ablation -> artifacts/
+python scripts/fit_bsts_vi.py        # explicit-state ADVI fits + forecasts -> artifacts/
+python scripts/fit_bsts_nuts.py      # explicit-state NUTS cold + warm starts -> artifacts/
+python scripts/fit_bsts_collapsed.py # collapsed full-year ADVI + NUTS + warm starts -> artifacts/
 ```
 
 The processed splits are committed, so the model scripts and notebooks run
