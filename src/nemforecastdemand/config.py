@@ -63,10 +63,13 @@ class WeatherConfig:
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    """Harmonic counts for the seasonal design matrix."""
+    """Seasonal design settings: basis family and size."""
 
+    seasonal_basis: str
     daily_harmonics: int
     weekly_harmonics: int
+    daily_rbf_centres: int
+    weekly_rbf_centres: int
 
 
 @dataclass(frozen=True)

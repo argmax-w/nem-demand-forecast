@@ -1,9 +1,11 @@
 # Data provenance
 
-All timestamps in this project are NEM market time (AEST, UTC+10, no daylight
-saving), represented by the `Australia/Brisbane` zone, in period-start
-convention. The processed splits in `processed/` are committed so reviewers
-can reproduce results without downloading anything.
+All series are stored and modelled in UTC with period-start timestamps;
+display layers convert to AEST (the NEM market time, a fixed UTC+10 with no
+daylight saving). AEMO publishes interval-ending market-time stamps, which
+the data layer shifts and converts on ingestion. The processed splits in
+`processed/` are committed so reviewers can reproduce results without
+downloading anything.
 
 ## Demand
 
@@ -19,9 +21,9 @@ can reproduce results without downloading anything.
   column of `DISPATCHREGIONSUM` that most wrappers (for example NEMOSIS)
   expose, and the OPERATIONAL_DEMAND package is absent from the MMSDM monthly
   archives, so the reports are fetched directly.
-- **Conventions:** AEMO stamps each half hour with its ending time; the data
-  layer shifts stamps to period start. Duplicate publications are resolved by
-  the latest `LASTCHANGED`.
+- **Conventions:** AEMO stamps each half hour with its ending time in market
+  time; the data layer shifts stamps to period start and converts to UTC.
+  Duplicate publications are resolved by the latest `LASTCHANGED`.
 - **Retention:** NEMWeb keeps roughly thirteen months of `ACTUAL_HH`
   archives. This binds the study window (see `config/default.yaml`); rerunning
   the download much later requires moving the window forward. The committed

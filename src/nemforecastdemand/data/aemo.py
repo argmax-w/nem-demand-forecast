@@ -11,9 +11,10 @@ archives, so this module fetches the reports directly from NEMWeb.
 
 NEMWeb retains roughly thirteen months of ``ACTUAL_HH`` archives as weekly
 zips, each holding one inner zip per half hour. AEMO stamps intervals with
-their ending time in market time (AEST, no daylight saving); everything
-downstream uses period-start timestamps, so the parser shifts the stamps back
-by thirty minutes.
+their ending time in market time (AEST, UTC+10, no daylight saving). The
+project stores everything in UTC with period-start timestamps, so the parser
+shifts stamps back by thirty minutes and converts the fixed-offset market
+time to UTC on the way out. Plots convert back to AEST at the display layer.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import polars as pl
 import requests
 
 ARCHIVE_URL = "https://nemweb.com.au/Reports/ARCHIVE/Operational_Demand/ACTUAL_HH/"
+MARKET_TZ = "Australia/Brisbane"
 _HEADERS = {"User-Agent": "nem-demand-forecast (github.com/argmax-w/nem-demand-forecast)"}
 _ZIP_NAME = re.compile(r"PUBLIC_ACTUAL_OPERATIONAL_DEMAND_HH_(\d{8})\.zip", re.IGNORECASE)
 _DATA_ROW_PREFIX = b"D,OPERATIONAL_DEMAND,ACTUAL"
@@ -169,8 +171,9 @@ def load_demand(
     Returns
     -------
     polars.DataFrame
-        Columns ``ts`` (naive market-time period start, strictly increasing)
-        and ``demand_mw``. Duplicate publications are resolved by keeping the
+        Columns ``ts`` (UTC period start, strictly increasing) and
+        ``demand_mw``. The window bounds are market-time days, matching the
+        archive layout; duplicate publications are resolved by keeping the
         latest ``LASTCHANGED``.
     """
     paths = download_archive(start, end, raw_dir)
@@ -183,6 +186,11 @@ def load_demand(
         .unique(subset="interval_datetime", keep="last")
         .with_columns(ts=pl.col("interval_datetime") - pl.duration(minutes=30))
         .filter((pl.col("ts") >= lower) & (pl.col("ts") < upper))
+        .with_columns(
+            # Market time is a fixed +10:00 offset, so this conversion is
+            # unambiguous year-round.
+            ts=pl.col("ts").dt.replace_time_zone(MARKET_TZ).dt.convert_time_zone("UTC")
+        )
         .select("ts", demand_mw=pl.col("operational_demand"))
         .sort("ts")
     )

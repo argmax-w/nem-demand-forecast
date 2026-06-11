@@ -1,8 +1,9 @@
 # Configuration for day-ahead probabilistic forecasting of NSW1 operational demand.
 #
-# All timestamps are in NEM market time (AEST, UTC+10, no daylight saving),
-# represented by the Australia/Brisbane zone. Prior scales for the BSTS apply
-# to demand standardised on the fitting window.
+# Storage and modelling are in UTC. The timezone below is NEM market time
+# (AEST, UTC+10, no daylight saving), used for window boundaries, forecast
+# origins and display. Prior scales for the BSTS apply to demand standardised
+# on the fitting window.
 
 region: NSW1
 timezone: Australia/Brisbane
@@ -38,8 +39,15 @@ weather:
   cooling_base: 20.5 # degrees C, demand rises above this
 
 features:
+  # Seasonal basis for the daily and weekly cycles. The RBF counts are chosen
+  # to match the trigonometric column counts (2K), so swapping the basis
+  # holds model size fixed; the bases are assessed against each other on the
+  # validation set in notebook 02.
+  seasonal_basis: fourier # fourier | rbf
   daily_harmonics: 10
   weekly_harmonics: 6
+  daily_rbf_centres: 20
+  weekly_rbf_centres: 12
 
 arima:
   # Candidate (p, d, q) orders for the regression residuals, selected on the

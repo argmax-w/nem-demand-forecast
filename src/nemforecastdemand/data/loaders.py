@@ -3,6 +3,10 @@
 The processed splits are small parquet files committed to the repository so
 results are reproducible without credentials. Every consumer goes through
 :func:`load_split`, which enforces the schema before anything touches a model.
+
+Storage convention: all indices are UTC period-start timestamps. AEST exists
+only at the display layer and local Sydney clock time only inside calendar
+feature construction.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+STORAGE_TZ = "UTC"
 MARKET_TZ = "Australia/Brisbane"
 SPLIT_NAMES = ("train", "validation", "test")
 
@@ -31,7 +36,7 @@ def validate_panel(frame: pd.DataFrame, name: str = "panel") -> None:
     Parameters
     ----------
     frame
-        Panel indexed by market-time period-start timestamps.
+        Panel indexed by UTC period-start timestamps.
     name
         Label used in error messages.
 
@@ -49,8 +54,8 @@ def validate_panel(frame: pd.DataFrame, name: str = "panel") -> None:
                 f"{name}: column {column} has dtype {frame[column].dtype}, expected {dtype}"
             )
     index = frame.index
-    if not isinstance(index, pd.DatetimeIndex) or str(index.tz) != MARKET_TZ:
-        raise ValueError(f"{name}: index must be a DatetimeIndex in {MARKET_TZ}")
+    if not isinstance(index, pd.DatetimeIndex) or str(index.tz) != STORAGE_TZ:
+        raise ValueError(f"{name}: index must be a DatetimeIndex in {STORAGE_TZ}")
     deltas = np.diff(index.asi8)
     if len(frame) and not (deltas == 30 * 60 * 1_000_000_000).all():
         raise ValueError(f"{name}: index is not a strict half-hourly grid")
