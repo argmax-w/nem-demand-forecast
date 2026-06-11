@@ -287,6 +287,120 @@ plt.show()
 # mass matrix. The conclusion belongs to whatever the numbers above say,
 # and notebook 05 carries the timing column into the final comparison.
 #
+# ## Collapsing the states: dimension against data
+#
+# The explicit-state formulation is the demanding inference exercise, but
+# it caps the data window: every half hour adds two latent dimensions, so a
+# year of history would put NUTS in a 70,000-dimensional space and rule out
+# the full-rank guide entirely. The production alternative marginalises the
+# states analytically (conditional on the hyperparameters the trend is
+# linear-Gaussian, so a Kalman filter inside the likelihood integrates them
+# out exactly) and samples only the roughly fifty hyperparameters. The cost
+# moves from dimension to gradient: every leapfrog now runs a sequential
+# filter over fifteen thousand steps. Same priors, same structure, full
+# training year.
+
+# %%
+collapsed, collapsed_meta = load_artifact(cfg.paths.artifacts / "bsts_collapsed_nuts_cold")
+
+
+def cold_row(meta: dict, dims: int, steps: int) -> dict:
+    timing = meta["timings_seconds"]
+    return {
+        "latent dimensions": dims,
+        "data half hours": steps,
+        "warmup (s)": timing["warmup_seconds"],
+        "sampling (s)": timing["sample_seconds"],
+        "min bulk ESS": meta["min_bulk_ess"],
+        "ESS per s": meta["min_bulk_ess"] / timing["sample_seconds"],
+        "max R-hat": meta["max_rhat"],
+        "divergences": meta["total_divergences"],
+    }
+
+
+explicit_dims = sum(row["size"] for row in cold_meta["site_summary"])
+collapsed_dims = sum(row["size"] for row in collapsed_meta["site_summary"])
+pd.DataFrame(
+    {
+        "explicit states, 56 days": cold_row(cold_meta, explicit_dims, cfg.bsts.train_days * 48),
+        "collapsed states, full year": cold_row(
+            collapsed_meta, collapsed_dims, collapsed_meta["fit_steps"]
+        ),
+    }
+).T.round(3)
+
+# %% [markdown]
+# The hyperparameter posteriors are not expected to agree exactly: the
+# collapsed fit sees a year of data, so its innovation scales answer "how
+# much does the level drift through whole seasons" while the explicit fit
+# answers the same question for one recent eight-week window. The contrast
+# is therefore formulation and window together, which is the operational
+# question: what does the stiff short-window trend understate?
+
+# %%
+fig, axes = plt.subplots(1, len(compare_sites), figsize=(13, 3.2))
+for ax, site in zip(axes, compare_sites, strict=True):
+    explicit_draws = cold[f"post_{site}"].ravel()
+    collapsed_draws = collapsed[f"post_{site}"].ravel()
+    grid = np.linspace(
+        min(explicit_draws.min(), collapsed_draws.min()),
+        max(explicit_draws.max(), collapsed_draws.max()),
+        120,
+    )
+    centres = (grid[:-1] + grid[1:]) / 2
+    for label, draws, colour in (
+        ("explicit, 56 d", explicit_draws, "black"),
+        ("collapsed, year", collapsed_draws, palette("temperature")),
+    ):
+        ax.plot(
+            centres,
+            np.histogram(draws, bins=grid, density=True)[0],
+            label=label,
+            color=colour,
+            lw=1.2,
+        )
+    ax.set_title(site)
+    ax.set_yticks([])
+axes[0].legend()
+fig.suptitle("NUTS posteriors: explicit 56-day window against collapsed full year", y=1.04)
+save_figure(fig, "explicit_vs_collapsed_posteriors", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# The collapsed warm starts repeat the accounting at fifty dimensions,
+# where the surrogate covariance is cheap to estimate well; against the
+# explicit table above, they show how much of the warm start's value
+# depends on the dimensionality of the space being warmed.
+
+# %%
+rows = {}
+collapsed_runs = {"collapsed cold": collapsed_meta}
+for kind in ("meanfield", "fullrank"):
+    for reduced in cfg.warm_start.reduced_warmup:
+        stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+        collapsed_runs[f"collapsed warm {kind} w={reduced}"] = load_artifact(
+            cfg.paths.artifacts / stem
+        )[1]
+for name, meta in collapsed_runs.items():
+    timing = meta["timings_seconds"]
+    advi_seconds = meta.get("advi_seconds", 0.0)
+    to_target = time_to_target_ess(
+        timing["warmup_seconds"], timing["sample_seconds"], meta["min_bulk_ess"], target
+    )
+    rows[name] = {
+        "ADVI (s)": advi_seconds,
+        "warmup (s)": timing["warmup_seconds"],
+        "sampling (s)": timing["sample_seconds"],
+        "min bulk ESS": meta["min_bulk_ess"],
+        "max R-hat": meta["max_rhat"],
+        "divergences": meta["total_divergences"],
+        f"total to ESS {target:.0f} (s)": advi_seconds + to_target,
+        "quality met": meta["max_rhat"] < cfg.warm_start.rhat_threshold
+        and meta["total_divergences"] == 0,
+    }
+pd.DataFrame(rows).T.round(3)
+
+# %% [markdown]
 # ## GPU against CPU
 #
 # The same fits, same code, same XLA pipeline, on the RTX 4000 Ada versus

@@ -16,6 +16,10 @@
 # - **One BSTS, three posteriors**: the structural model of notebooks 03
 #   and 04 fitted by mean-field ADVI, full-rank ADVI and NUTS. Same model,
 #   same priors, same data; the inference algorithm is the only difference.
+# - **The collapsed BSTS, three posteriors**: identical structure and
+#   priors with the latent states marginalised through a Kalman filter, so
+#   the same three inference algorithms run over the full training year
+#   instead of the 56-day window (notebook 04 develops the formulation).
 #
 # Scores: CRPS (primary), log score, pinball loss, MAE, MASE, central
 # coverage, PIT calibration and the energy score over whole 48-step paths.
@@ -61,6 +65,13 @@ arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 nuts, nuts_meta = load_artifact(cfg.paths.artifacts / "bsts_nuts_cold")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
 vi = {k: load_artifact(cfg.paths.artifacts / f"bsts_vi_{k}") for k in ("meanfield", "fullrank")}
+collapsed_nuts, collapsed_nuts_meta = load_artifact(
+    cfg.paths.artifacts / "bsts_collapsed_nuts_cold"
+)
+collapsed_vi = {
+    k: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{k}")
+    for k in ("meanfield", "fullrank")
+}
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
 )
@@ -75,6 +86,9 @@ MODELS = [
     "BSTS ADVI mean-field",
     "BSTS ADVI full-rank",
     "BSTS NUTS",
+    "collapsed ADVI mean-field (year)",
+    "collapsed ADVI full-rank (year)",
+    "collapsed NUTS (year)",
 ]
 COLOURS = {
     "seasonal naive": "#9a9a9a",
@@ -83,7 +97,11 @@ COLOURS = {
     "BSTS ADVI mean-field": palette("demand"),
     "BSTS ADVI full-rank": palette("accent"),
     "BSTS NUTS": "black",
+    "collapsed ADVI mean-field (year)": "#4f9da6",
+    "collapsed ADVI full-rank (year)": "#b3589a",
+    "collapsed NUTS (year)": palette("temperature"),
 }
+PIT_MODELS = ["ARIMA", "LightGBM", "BSTS NUTS", "collapsed NUTS (year)"]
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -197,6 +215,11 @@ scores = {
     "BSTS ADVI mean-field": sample_scores(vi["meanfield"][0]["forecast_paths"]),
     "BSTS ADVI full-rank": sample_scores(vi["fullrank"][0]["forecast_paths"]),
     "BSTS NUTS": sample_scores(nuts["forecast_paths"]),
+    "collapsed ADVI mean-field (year)": sample_scores(
+        collapsed_vi["meanfield"][0]["forecast_paths"]
+    ),
+    "collapsed ADVI full-rank (year)": sample_scores(collapsed_vi["fullrank"][0]["forecast_paths"]),
+    "collapsed NUTS (year)": sample_scores(collapsed_nuts["forecast_paths"]),
 }
 
 # %% [markdown]
@@ -269,6 +292,8 @@ pairs = [
     ("BSTS ADVI full-rank", "BSTS NUTS"),
     ("LightGBM", "ARIMA"),
     ("LightGBM", "BSTS NUTS"),
+    ("collapsed NUTS (year)", "BSTS NUTS"),
+    ("LightGBM", "collapsed NUTS (year)"),
     ("ARIMA", "seasonal naive"),
 ]
 sig_rows = {}
@@ -283,8 +308,8 @@ pd.DataFrame(sig_rows).T.round(3)
 # ## Calibration
 
 # %%
-fig, axes = plt.subplots(1, len(MODELS) - 1, figsize=(15, 3), sharey=True)
-for ax, name in zip(axes, MODELS[1:], strict=True):
+fig, axes = plt.subplots(1, len(PIT_MODELS), figsize=(13, 3), sharey=True)
+for ax, name in zip(axes, PIT_MODELS, strict=True):
     density, edges = pit_histogram(scores[name]["pit"], bins=20)
     ax.bar(edges[:-1], density, width=np.diff(edges), align="edge", color=COLOURS[name], alpha=0.85)
     ax.axhline(1.0, color="grey", lw=0.8)
@@ -301,6 +326,8 @@ plt.show()
 # %%
 fig, ax = plt.subplots(figsize=(8.5, 4.5))
 for name in MODELS:
+    if name in ("collapsed ADVI mean-field (year)", "collapsed ADVI full-rank (year)"):
+        continue  # nearly coincident with collapsed NUTS; the table carries them
     horizon_curve(ax, scores[name]["per_step_crps"], name, COLOURS[name])
 ax.set_ylabel("CRPS (MW)")
 ax.set_title("CRPS by lead time, archived forecast weather")
@@ -349,6 +376,7 @@ def sweep_crps(name: str) -> list[float]:
                 "BSTS ADVI mean-field": vi["meanfield"][0],
                 "BSTS ADVI full-rank": vi["fullrank"][0],
                 "BSTS NUTS": nuts,
+                "collapsed NUTS (year)": collapsed_nuts,
             }[name][f"{variant}_paths"]
             out.append(
                 float(
@@ -364,7 +392,7 @@ def sweep_crps(name: str) -> list[float]:
 
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
-for name in MODELS[1:]:
+for name in ("ARIMA", "LightGBM", "BSTS NUTS", "collapsed NUTS (year)"):
     values = sweep_crps(name)
     ax.plot(sweep_x, values, marker="o", ms=4, color=COLOURS[name], label=name)
     headline = scores[name]["per_origin_crps"].mean()
@@ -459,6 +487,26 @@ compute_rows = {
             nuts_timing["warmup_seconds"],
             nuts_timing["sample_seconds"],
             nuts_meta["min_bulk_ess"],
+            cfg.warm_start.target_bulk_ess,
+        ),
+    },
+    "collapsed ADVI mean-field (year)": {
+        "fit (s)": collapsed_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
+        "forecast all origins (s)": collapsed_vi["meanfield"][1]["timings_seconds"][
+            "predict_seconds"
+        ],
+    },
+    "collapsed NUTS (year)": {
+        "fit (s)": collapsed_nuts_meta["timings_seconds"]["warmup_seconds"]
+        + collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
+        "forecast all origins (s)": collapsed_nuts_meta["predict_seconds"],
+        "min bulk ESS": collapsed_nuts_meta["min_bulk_ess"],
+        "ESS per s": collapsed_nuts_meta["min_bulk_ess"]
+        / collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
+        "to ESS 400 (s)": time_to_target_ess(
+            collapsed_nuts_meta["timings_seconds"]["warmup_seconds"],
+            collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
+            collapsed_nuts_meta["min_bulk_ess"],
             cfg.warm_start.target_bulk_ess,
         ),
     },
