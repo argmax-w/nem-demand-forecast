@@ -1,0 +1,106 @@
+# Configuration for day-ahead probabilistic forecasting of NSW1 operational demand.
+#
+# All timestamps are in NEM market time (AEST, UTC+10, no daylight saving),
+# represented by the Australia/Brisbane zone. Prior scales for the BSTS apply
+# to demand standardised on the fitting window.
+
+region: NSW1
+timezone: Australia/Brisbane
+frequency: 30min
+horizon: 48 # half-hourly steps, one day ahead
+
+grid_point:
+  latitude: -33.87
+  longitude: 151.21
+  label: Sydney Observatory Hill
+
+window:
+  start: "2024-01-01"
+  end: "2026-05-31"
+
+splits:
+  train: 0.70
+  validation: 0.15
+  test: 0.15
+
+demand:
+  source: nemweb # nemosis | nemweb
+
+weather:
+  actuals_model: era5
+  forecast_model: bom_access_global
+  lead_days: 1
+  variables: [temperature_2m]
+  heating_base: 16.5 # degrees C, demand rises below this
+  cooling_base: 20.5 # degrees C, demand rises above this
+
+features:
+  daily_harmonics: 10
+  weekly_harmonics: 6
+
+arima:
+  # Candidate (p, d, q) orders for the regression residuals, selected on the
+  # validation set. Seasonality and weather live in the exogenous regressors,
+  # so the residual process is kept low order and stationary.
+  candidate_orders:
+    - [1, 0, 1]
+    - [2, 0, 1]
+    - [2, 0, 2]
+    - [3, 0, 1]
+    - [3, 0, 2]
+    - [4, 0, 2]
+  train_days: 56
+
+bsts:
+  train_days: 56
+  damped_slope: true
+  obs_family: gaussian # gaussian | student_t
+  priors:
+    level_scale: 0.1 # HalfNormal, per-step level innovation
+    slope_scale: 0.01 # HalfNormal, per-step slope innovation
+    damping_alpha: 8.0 # Beta prior on the slope damping factor
+    damping_beta: 2.0
+    coef_scale: 1.0 # Normal, regression coefficients
+    obs_scale: 0.5 # HalfNormal, observation noise
+    init_level_scale: 2.0
+    init_slope_scale: 0.1
+    student_t_df_rate: 0.1 # Exponential rate for (df - 2) under student_t
+
+vi:
+  steps: 20000
+  learning_rate: 0.01
+  num_particles: 8
+  log_every: 100
+  eval_particles: 64 # particles for the logged ELBO decomposition
+  posterior_draws: 1000
+
+nuts:
+  chains: 4
+  warmup: 1000
+  samples: 1000
+  target_accept: 0.85
+  max_tree_depth: 10
+  chain_method: vectorized
+
+warm_start:
+  reduced_warmup: [100, 300]
+  target_bulk_ess: 400
+  rhat_threshold: 1.01
+
+perturbation:
+  # Multiples of the fitted forecast-error magnitude swept at forecast time.
+  sweep_multipliers: [0.0, 0.5, 1.0, 1.5, 2.0]
+
+evaluation:
+  quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+  interval_levels: [0.5, 0.8, 0.95]
+  crps_chunk: 256 # posterior draws per chunk in the streaming CRPS
+
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  artifacts: artifacts
+  figures: reports/figures
+
+seed: 20260611
