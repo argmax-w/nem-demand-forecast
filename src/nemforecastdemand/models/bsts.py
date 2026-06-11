@@ -192,6 +192,78 @@ def bsts_model(
         numpyro.sample("y", dist.Normal(mu, sigma_obs), obs=y)
 
 
+def bsts_collapsed_model(
+    y: jnp.ndarray,
+    x_mean: jnp.ndarray,
+    x_var: jnp.ndarray,
+    bsts: BstsConfig,
+) -> None:
+    """The same generative model with the states marginalised analytically.
+
+    Conditional on the hyperparameters the trend is linear-Gaussian, so the
+    latent states integrate out exactly through a Kalman filter and the
+    marginal likelihood is the product of one-step Gaussian predictives.
+    NUTS and ADVI then work in the roughly fifty-dimensional hyperparameter
+    space regardless of the data length, which is what makes a full year of
+    half hours tractable; the trade is a sequential filter pass inside
+    every gradient evaluation. Priors and structure match
+    :func:`bsts_model` exactly; the initial state enters through its prior
+    rather than as a sampled site.
+    """
+    if bsts.obs_family != "gaussian":
+        raise ValueError("the collapsed likelihood requires Gaussian observations")
+    priors = bsts.priors
+    n_coefs = x_mean.shape[1]
+
+    sigma_level = numpyro.sample("sigma_level", dist.HalfNormal(priors.level_scale))
+    sigma_slope = numpyro.sample("sigma_slope", dist.HalfNormal(priors.slope_scale))
+    phi = (
+        numpyro.sample("phi", dist.Beta(priors.damping_alpha, priors.damping_beta))
+        if bsts.damped_slope
+        else 1.0
+    )
+    beta = numpyro.sample("beta", dist.Normal(0.0, priors.coef_scale).expand([n_coefs]).to_event(1))
+    if bsts.heteroskedastic:
+        gamma0 = numpyro.sample(
+            "gamma0", dist.Normal(priors.var_intercept_loc, priors.var_intercept_scale)
+        )
+        gamma = numpyro.sample(
+            "gamma",
+            dist.Normal(0.0, priors.var_coef_scale).expand([x_var.shape[1]]).to_event(1),
+        )
+        sigma_obs = jnp.exp(jnp.clip(gamma0 + x_var @ gamma, -8.0, 3.0))
+    else:
+        sigma_obs = numpyro.sample("gamma0", dist.HalfNormal(priors.obs_scale)) * jnp.ones(
+            x_var.shape[0]
+        )
+
+    transition = jnp.array([[1.0, 1.0], [0.0, phi]])
+    process_cov = jnp.diag(jnp.array([sigma_level**2, sigma_slope**2]))
+    regression = x_mean @ beta
+    mean0 = jnp.zeros(2)
+    cov0 = jnp.diag(jnp.array([priors.init_level_scale**2, priors.init_slope_scale**2]))
+
+    def step(carry, inputs):
+        mean, cov = carry
+        obs, reg, sd = inputs
+        mean = transition @ mean
+        cov = transition @ cov @ transition.T + process_cov
+        innovation = obs - (mean[0] + reg)
+        innovation_var = cov[0, 0] + sd**2
+        log_density = -0.5 * (
+            jnp.log(2.0 * jnp.pi * innovation_var) + innovation**2 / innovation_var
+        )
+        gain = cov[:, 0] / innovation_var
+        mean = mean + gain * innovation
+        cov = cov - jnp.outer(gain, cov[0, :])
+        return (mean, cov), log_density
+
+    # The unroll trades a little compile time for far fewer sequential
+    # kernel launches, which dominates a long scan of tiny updates.
+    _, log_densities = jax.lax.scan(step, (mean0, cov0), (y, regression, sigma_obs), unroll=16)
+    numpyro.factor("marginal_loglik", log_densities.sum())
+
+
 def states_from_draws(
     draws: dict[str, np.ndarray], bsts: BstsConfig, chunk: int = 200
 ) -> np.ndarray:
