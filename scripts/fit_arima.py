@@ -157,7 +157,7 @@ def main() -> None:
         "forecast_seconds_per_origin": timings["test_forecasts"]
         / (len(test_origins) * len(variants)),
         "naive_train_mae_mw": naive.train_mae,
-        "n_exog": int(len(model.results.model.exog_names)),
+        "n_exog": len(model.results.model.exog_names),
         "fit_window": [str(final_fit[0]), str(final_fit[-1])],
         "perturbation": {
             column: {"rho": p.rho, "sigma_mean": float(p.sigma_by_step.mean())}

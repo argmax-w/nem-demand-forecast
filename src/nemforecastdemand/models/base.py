@@ -175,7 +175,7 @@ def perturbation_overrides(
     origin_token = int(index[0].value) % (2**31)
     overrides = {}
     for i, (column, model) in enumerate(models.items()):
-        rng = np.random.default_rng([seed, origin_token, i, int(round(multiplier * 10))])
+        rng = np.random.default_rng([seed, origin_token, i, round(multiplier * 10)])
         actual = panel.loc[index, column].to_numpy(dtype=np.float64)
         overrides[column] = model.sample(actual, steps, multiplier, rng)
     return pd.DataFrame(overrides, index=index)

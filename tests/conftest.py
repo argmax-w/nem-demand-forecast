@@ -30,9 +30,11 @@ def make_panel(start_market: str, days: int, seed: int = 0) -> pd.DataFrame:
         {
             "demand_mw": 7000 + 900 * daily + rng.normal(0, 80, len(index)),
             "temp_c": temp,
+            "dew_c": temp - 5.0,
             "dni_wm2": sun,
             "dhi_wm2": sun * 0.3,
             "temp_fc_c": temp + rng.normal(0, 0.8, len(index)),
+            "dew_fc_c": temp - 5.0 + rng.normal(0, 0.9, len(index)),
             "dni_fc_wm2": np.maximum(sun + rng.normal(0, 40, len(index)), 0),
             "dhi_fc_wm2": np.maximum(sun * 0.3 + rng.normal(0, 15, len(index)), 0),
         },
