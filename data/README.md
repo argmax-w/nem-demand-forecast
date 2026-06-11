@@ -44,7 +44,7 @@ interpolated to the half-hourly grid during preprocessing.
   to score forecasts. Contains modelled reanalysis, not station observations.
 - **Forecasts as issued:** Previous Runs API
   (`previous-runs-api.open-meteo.com/v1/forecast`), model `ecmwf_ifs025`,
-  variables `temperature_2m`, `direct_normal_irradiance` and
+  variables `temperature_2m`, `dew_point_2m`, `direct_normal_irradiance` and
   `diffuse_radiation`, each at the `previous_day1` offset. Every timestamp
   carries the value predicted for it by the run initialised one day earlier,
   so day-ahead covariates have no look-ahead. The Bureau's ACCESS-G

@@ -245,7 +245,9 @@ plt.show()
 # The trough of the U sits around 17 to 20 C, supporting the configured
 # heating and cooling bases (16.5 and 20.5 C) for the degree-day features.
 # The vertical spread at any given temperature is the daily cycle, which the
-# seasonal basis carries.
+# seasonal basis carries. Dew point enters the feature set alongside
+# dry-bulb temperature because humid summer evenings keep air conditioning
+# running at temperatures that would otherwise need none.
 #
 # Rooftop solar is the other defining feature of the modern NEM load shape.
 # Splitting days by midday irradiance shows the hollowed-out middle of the
@@ -320,6 +322,7 @@ panel, report = build_panel(
 residuals = pd.DataFrame(
     {
         "temperature (C)": panel["temp_fc_c"] - panel["temp_c"],
+        "dew point (C)": panel["dew_fc_c"] - panel["dew_c"],
         "DNI (W/m2)": panel["dni_fc_wm2"] - panel["dni_wm2"],
     }
 )
@@ -327,7 +330,7 @@ residuals.describe().loc[["mean", "std", "min", "max"]].T
 
 # %%
 hour = panel.index.tz_convert(DISPLAY_TZ).hour + panel.index.tz_convert(DISPLAY_TZ).minute / 60
-fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
 for ax, column in zip(axes, residuals.columns, strict=True):
     grouped = residuals[column].groupby(hour)
     ax.plot(grouped.mean().index, grouped.mean(), color=palette("forecast"), label="bias")
@@ -379,6 +382,66 @@ load_splits(cfg.paths.processed)
 split_summary(splits)
 
 # %% [markdown]
+# ## Trigonometric or radial seasonal basis?
+#
+# The daily and weekly cycles can be encoded as Fourier harmonics or as
+# periodic Gaussian radial basis functions over the same local-clock phases,
+# with matched column counts so model size stays fixed. Before any time-series
+# machinery, a plain least-squares regression of demand on the full design
+# (basis, weather, lags, holiday) settles which basis carries the seasonal
+# shape better as a predictor: fit on train, score on validation, no
+# leakage. The full ARIMA refits the comparison in notebook 02 as
+# confirmation.
+
+# %%
+from dataclasses import replace
+
+from nemforecastdemand.models.base import build_design
+
+y_all = panel["demand_mw"].astype(np.float64)
+basis_rows = {}
+basis_errors = {}
+for basis in ("fourier", "rbf"):
+    basis_cfg = replace(cfg, features=replace(cfg.features, seasonal_basis=basis))
+    design = build_design(panel, basis_cfg, weather_source="actual")
+    train_design = design.loc[splits["train"]].dropna()
+    val_design = design.loc[splits["validation"]]
+    train_matrix = np.column_stack([np.ones(len(train_design)), train_design.to_numpy()])
+    val_matrix = np.column_stack([np.ones(len(val_design)), val_design.to_numpy()])
+    coef, *_ = np.linalg.lstsq(train_matrix, y_all.loc[train_design.index].to_numpy(), rcond=None)
+    errors = y_all.loc[val_design.index] - val_matrix @ coef
+    basis_errors[basis] = errors
+    basis_rows[basis] = {
+        "design columns": design.shape[1],
+        "validation MAE (MW)": float(errors.abs().mean()),
+        "validation RMSE (MW)": float(np.sqrt((errors**2).mean())),
+    }
+pd.DataFrame(basis_rows).T
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 4))
+for basis, colour in (("fourier", palette("demand")), ("rbf", palette("accent"))):
+    hourly_mae = (
+        basis_errors[basis]
+        .abs()
+        .groupby(basis_errors[basis].index.tz_convert(LOCAL_TZ).hour)
+        .mean()
+    )
+    ax.plot(hourly_mae.index, hourly_mae, label=basis, color=colour)
+ax.set_xlabel("local Sydney hour")
+ax.set_ylabel("validation MAE (MW)")
+ax.set_title("The two bases are near-indistinguishable as predictors")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+# The bases land within noise of each other at matched size, including
+# through the sharp morning ramp where the localised bumps were expected to
+# help. The trigonometric basis is retained as the default for its exact
+# periodicity and interpretability; the RBF basis remains one configuration
+# switch away, and notebook 02 repeats this comparison inside the full
+# ARIMA model.
+#
 # ## Summary
 #
 # - The half-hourly grid is complete, duplicate-free and verified against

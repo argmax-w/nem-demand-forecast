@@ -20,6 +20,7 @@ from nemforecastdemand.features.calendar import holiday_flag
 #: Mapping from Open-Meteo variable names to panel column stems.
 VARIABLE_STEMS = {
     "temperature_2m": "temp_c",
+    "dew_point_2m": "dew_c",
     "direct_normal_irradiance": "dni_wm2",
     "diffuse_radiation": "dhi_wm2",
 }

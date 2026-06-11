@@ -26,9 +26,11 @@ SPLIT_NAMES = ("train", "validation", "test")
 PANEL_SCHEMA: dict[str, str] = {
     "demand_mw": "float32",
     "temp_c": "float32",
+    "dew_c": "float32",
     "dni_wm2": "float32",
     "dhi_wm2": "float32",
     "temp_fc_c": "float32",
+    "dew_fc_c": "float32",
     "dni_fc_wm2": "float32",
     "dhi_fc_wm2": "float32",
     "is_holiday": "bool",
@@ -69,8 +71,8 @@ def validate_panel(frame: pd.DataFrame, name: str = "panel") -> None:
         raise ValueError(f"{name}: numeric columns contain missing values")
     if (frame["demand_mw"] <= 0).any():
         raise ValueError(f"{name}: demand must be positive")
-    temps = numeric[["temp_c", "temp_fc_c"]]
-    if ((temps < -15) | (temps > 55)).any().any():
+    temps = numeric[["temp_c", "temp_fc_c", "dew_c", "dew_fc_c"]]
+    if ((temps < -25) | (temps > 55)).any().any():
         raise ValueError(f"{name}: temperatures outside a plausible range")
     irradiance = numeric[["dni_wm2", "dhi_wm2", "dni_fc_wm2", "dhi_fc_wm2"]]
     if ((irradiance < -1e-3) | (irradiance > 1500)).any().any():

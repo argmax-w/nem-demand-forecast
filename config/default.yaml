@@ -39,7 +39,7 @@ weather:
   # irradiance fields.
   forecast_model: ecmwf_ifs025
   lead_days: 1
-  variables: [temperature_2m, direct_normal_irradiance, diffuse_radiation]
+  variables: [temperature_2m, dew_point_2m, direct_normal_irradiance, diffuse_radiation]
   heating_base: 16.5 # degrees C, demand rises below this
   cooling_base: 20.5 # degrees C, demand rises above this
 

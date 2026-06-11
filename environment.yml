@@ -26,4 +26,5 @@ dependencies:
       # CPU wheels by default; on a CUDA machine install jax[cuda12] instead.
       - jax
       - numpyro
+      - optax
       - nemosis

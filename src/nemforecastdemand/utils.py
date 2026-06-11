@@ -1,11 +1,13 @@
-"""Seeding, timing and dtype helpers."""
+"""Seeding, timing, dtype and artifact helpers."""
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -114,3 +116,23 @@ def tree_to_float32(tree: object) -> object:
         return leaf
 
     return jax.tree.map(cast, tree)
+
+
+def save_artifact(stem: Path, arrays: dict[str, np.ndarray], meta: dict) -> None:
+    """Persist a fit's arrays and metadata side by side.
+
+    Arrays go to ``{stem}.npz`` (compressed) and JSON-serialisable metadata
+    (orders, timings, scores, settings) to ``{stem}.json``, so notebooks can
+    read results without refitting anything.
+    """
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(stem.with_suffix(".npz"), **arrays)
+    stem.with_suffix(".json").write_text(json.dumps(meta, indent=2, default=str))
+
+
+def load_artifact(stem: Path) -> tuple[dict[str, np.ndarray], dict]:
+    """Load arrays and metadata written by :func:`save_artifact`."""
+    with np.load(stem.with_suffix(".npz")) as bundle:
+        arrays = {name: bundle[name] for name in bundle.files}
+    meta = json.loads(stem.with_suffix(".json").read_text())
+    return arrays, meta

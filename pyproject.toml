@@ -24,6 +24,7 @@ dependencies = [
     "holidays>=0.40",
     "jax>=0.4.30",
     "numpyro>=0.15",
+    "optax>=0.2",
     "arviz>=0.17",
 ]
 
