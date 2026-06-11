@@ -14,9 +14,12 @@ grid_point:
   longitude: 151.21
   label: Sydney Observatory Hill
 
+# Inclusive market-time days, period-start convention. The window is governed
+# by archive depth: NEMWeb retains roughly thirteen months of half-hourly
+# operational demand actuals, which binds before the weather forecast archive.
 window:
-  start: "2024-01-01"
-  end: "2026-05-31"
+  start: "2025-05-18"
+  end: "2026-05-29"
 
 splits:
   train: 0.70
@@ -27,7 +30,7 @@ demand:
   source: nemweb # nemosis | nemweb
 
 weather:
-  actuals_model: era5
+  actuals_model: era5_seamless # ERA5 with the ERA5T tail for recent months
   forecast_model: bom_access_global
   lead_days: 1
   variables: [temperature_2m]

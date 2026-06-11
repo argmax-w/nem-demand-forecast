@@ -14,6 +14,7 @@ keywords = ["forecasting", "bayesian", "time-series", "energy", "NEM"]
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",
+    "polars>=1.0",
     "pyarrow>=14",
     "scipy>=1.11",
     "statsmodels>=0.14",
