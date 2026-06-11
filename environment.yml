@@ -1,0 +1,28 @@
+name: nem-demand-forecast
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - pyarrow
+  - scipy
+  - statsmodels
+  - matplotlib
+  - requests
+  - pyyaml
+  - holidays
+  - arviz
+  - jupyterlab
+  - jupytext
+  - nbconvert
+  - ipykernel
+  - pytest
+  - ruff
+  - pre-commit
+  - pip
+  - pip:
+      # CPU wheels by default; on a CUDA machine install jax[cuda12] instead.
+      - jax
+      - numpyro
+      - nemosis

@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nemforecastdemand"
+version = "0.1.0"
+description = "Probabilistic day-ahead forecasting of NSW1 operational demand: one Bayesian structural time-series model fitted by ADVI and by NUTS, benchmarked against dynamic harmonic regression with ARIMA errors"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "argmax-w" }]
+keywords = ["forecasting", "bayesian", "time-series", "energy", "NEM"]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "scipy>=1.11",
+    "statsmodels>=0.14",
+    "matplotlib>=3.8",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "holidays>=0.40",
+    "jax>=0.4.30",
+    "numpyro>=0.15",
+    "arviz>=0.17",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "pre-commit>=3.6",
+    "jupytext>=1.16",
+    "nbconvert>=7",
+    "ipykernel>=6",
+]
+data = ["nemosis>=3.2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nemforecastdemand"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "NPY", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Jupytext-paired notebooks mix narrative cells with code, so imports do not
+# sit at the top and bare expressions are used for display.
+"notebooks/*" = ["E402", "E501", "B018"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

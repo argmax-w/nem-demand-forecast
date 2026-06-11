@@ -1,0 +1,2 @@
+# Pair every notebook in this directory with a py:percent script for clean diffs.
+formats = "ipynb,py:percent"
