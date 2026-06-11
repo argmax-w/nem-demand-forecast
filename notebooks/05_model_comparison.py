@@ -226,6 +226,36 @@ master = pd.DataFrame(table).T
 master.round(2)
 
 # %% [markdown]
+# A note on what LightGBM's position actually shows. The time-series models
+# fit a recent 56-day window by design: the BSTS samples two latent
+# innovations per half hour, so a year of data would put NUTS in a
+# 70,000-dimensional space and take full-rank ADVI off the table entirely,
+# and the static linear designs both share would have to average their
+# temperature and seasonal coefficients across regimes they treat as fixed.
+# The trees face neither constraint, so they get the full year, the way a
+# practitioner would run them. The window ablation in the fitting script
+# separates data quantity from model class:
+
+# %%
+pd.Series(
+    {
+        "LightGBM, full training year": gbdt_meta["headline_test_crps_mw"],
+        f"LightGBM, same {gbdt_meta['window_ablation_days']}-day window as BSTS/ARIMA": gbdt_meta[
+            "window_ablation_crps_mw"
+        ],
+        "ARIMA, 56-day window": float(scores["ARIMA"]["per_origin_crps"].mean()),
+        "BSTS NUTS, 56-day window": float(scores["BSTS NUTS"]["per_origin_crps"].mean()),
+    },
+    name="test CRPS (MW)",
+).to_frame().round(1)
+
+# %% [markdown]
+# On equal data the gradient-boosted model falls behind both structured
+# models: its advantage is the year of history, not the model class. The
+# structured models impose what the trees must learn, which is exactly what
+# makes them data-efficient in the small-window regime and what caps them
+# when history is abundant.
+#
 # ## Are the differences real?
 #
 # Paired block bootstrap over origins on per-origin CRPS (10,000 resamples).
