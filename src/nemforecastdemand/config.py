@@ -63,13 +63,14 @@ class WeatherConfig:
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    """Seasonal design settings: basis family and size."""
+    """Design settings: seasonal basis family and size, demand lags."""
 
     seasonal_basis: str
     daily_harmonics: int
     weekly_harmonics: int
     daily_rbf_centres: int
     weekly_rbf_centres: int
+    demand_lags: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,9 @@ class BstsPriors:
     damping_beta: float
     coef_scale: float
     obs_scale: float
+    var_intercept_loc: float
+    var_intercept_scale: float
+    var_coef_scale: float
     init_level_scale: float
     init_slope_scale: float
     student_t_df_rate: float
@@ -102,6 +106,9 @@ class BstsConfig:
     train_days: int
     damped_slope: bool
     obs_family: str
+    heteroskedastic: bool
+    variance_daily_harmonics: int
+    variance_use_degree_days: bool
     priors: BstsPriors
 
 
@@ -173,6 +180,7 @@ class Config:
     timezone: str
     frequency: str
     horizon: int
+    origins: tuple[str, ...]
     grid_point: GridPoint
     window: Window
     splits: Splits
@@ -219,6 +227,7 @@ def load_config(path: str | Path | None = None) -> Config:
         timezone=raw["timezone"],
         frequency=raw["frequency"],
         horizon=int(raw["horizon"]),
+        origins=tuple(raw["origins"]),
         grid_point=GridPoint(**raw["grid_point"]),
         window=Window(**raw["window"]),
         splits=Splits(**raw["splits"]),
@@ -231,7 +240,14 @@ def load_config(path: str | Path | None = None) -> Config:
             heating_base=float(raw["weather"]["heating_base"]),
             cooling_base=float(raw["weather"]["cooling_base"]),
         ),
-        features=FeatureConfig(**raw["features"]),
+        features=FeatureConfig(
+            seasonal_basis=raw["features"]["seasonal_basis"],
+            daily_harmonics=int(raw["features"]["daily_harmonics"]),
+            weekly_harmonics=int(raw["features"]["weekly_harmonics"]),
+            daily_rbf_centres=int(raw["features"]["daily_rbf_centres"]),
+            weekly_rbf_centres=int(raw["features"]["weekly_rbf_centres"]),
+            demand_lags=tuple(int(lag) for lag in raw["features"]["demand_lags"]),
+        ),
         arima=ArimaConfig(
             candidate_orders=_as_int_triples(raw["arima"]["candidate_orders"]),
             train_days=int(raw["arima"]["train_days"]),
@@ -240,6 +256,9 @@ def load_config(path: str | Path | None = None) -> Config:
             train_days=int(raw["bsts"]["train_days"]),
             damped_slope=bool(raw["bsts"]["damped_slope"]),
             obs_family=raw["bsts"]["obs_family"],
+            heteroskedastic=bool(raw["bsts"]["heteroskedastic"]),
+            variance_daily_harmonics=int(raw["bsts"]["variance_daily_harmonics"]),
+            variance_use_degree_days=bool(raw["bsts"]["variance_use_degree_days"]),
             priors=BstsPriors(**raw["bsts"]["priors"]),
         ),
         vi=ViConfig(**raw["vi"]),

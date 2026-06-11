@@ -21,11 +21,16 @@ STORAGE_TZ = "UTC"
 MARKET_TZ = "Australia/Brisbane"
 SPLIT_NAMES = ("train", "validation", "test")
 
-#: Required columns of the processed panel and their dtypes.
+#: Required columns of the processed panel and their dtypes. The ``_fc``
+#: columns hold the day-ahead forecast issued one day earlier.
 PANEL_SCHEMA: dict[str, str] = {
     "demand_mw": "float32",
     "temp_c": "float32",
+    "dni_wm2": "float32",
+    "dhi_wm2": "float32",
     "temp_fc_c": "float32",
+    "dni_fc_wm2": "float32",
+    "dhi_fc_wm2": "float32",
     "is_holiday": "bool",
 }
 
@@ -56,10 +61,10 @@ def validate_panel(frame: pd.DataFrame, name: str = "panel") -> None:
     index = frame.index
     if not isinstance(index, pd.DatetimeIndex) or str(index.tz) != STORAGE_TZ:
         raise ValueError(f"{name}: index must be a DatetimeIndex in {STORAGE_TZ}")
-    deltas = np.diff(index.asi8)
-    if len(frame) and not (deltas == 30 * 60 * 1_000_000_000).all():
+    deltas = np.diff(index.to_numpy())
+    if len(frame) > 1 and not (deltas == np.timedelta64(30, "m")).all():
         raise ValueError(f"{name}: index is not a strict half-hourly grid")
-    numeric = frame[["demand_mw", "temp_c", "temp_fc_c"]]
+    numeric = frame.drop(columns="is_holiday")
     if numeric.isna().any().any():
         raise ValueError(f"{name}: numeric columns contain missing values")
     if (frame["demand_mw"] <= 0).any():
@@ -67,6 +72,9 @@ def validate_panel(frame: pd.DataFrame, name: str = "panel") -> None:
     temps = numeric[["temp_c", "temp_fc_c"]]
     if ((temps < -15) | (temps > 55)).any().any():
         raise ValueError(f"{name}: temperatures outside a plausible range")
+    irradiance = numeric[["dni_wm2", "dhi_wm2", "dni_fc_wm2", "dhi_fc_wm2"]]
+    if ((irradiance < -1e-3) | (irradiance > 1500)).any().any():
+        raise ValueError(f"{name}: irradiance outside a plausible range")
 
 
 def load_split(name: str, processed_dir: Path) -> pd.DataFrame:

@@ -8,7 +8,8 @@
 region: NSW1
 timezone: Australia/Brisbane
 frequency: 30min
-horizon: 48 # half-hourly steps, one day ahead
+horizon: 48 # half-hourly steps, 24 hours from each origin
+origins: ["00:00", "12:00"] # forecast issue times, market clock
 
 grid_point:
   latitude: -33.87
@@ -32,9 +33,13 @@ demand:
 
 weather:
   actuals_model: era5_seamless # ERA5 with the ERA5T tail for recent months
-  forecast_model: bom_access_global
+  # ECMWF IFS rather than the Bureau's ACCESS-G: the previous-runs archive
+  # for bom_access_global is empty over this window (verified at download
+  # time), while ecmwf_ifs025 carries full hourly coverage including the
+  # irradiance fields.
+  forecast_model: ecmwf_ifs025
   lead_days: 1
-  variables: [temperature_2m]
+  variables: [temperature_2m, direct_normal_irradiance, diffuse_radiation]
   heating_base: 16.5 # degrees C, demand rises below this
   cooling_base: 20.5 # degrees C, demand rises above this
 
@@ -48,6 +53,9 @@ features:
   weekly_harmonics: 6
   daily_rbf_centres: 20
   weekly_rbf_centres: 12
+  # Demand lags, in half-hourly steps. Both stay behind the origin across a
+  # 48-step horizon, so no recursive feedback is needed at forecast time.
+  demand_lags: [48, 336]
 
 arima:
   # Candidate (p, d, q) orders for the regression residuals, selected on the
@@ -66,13 +74,23 @@ bsts:
   train_days: 56
   damped_slope: true
   obs_family: gaussian # gaussian | student_t
+  # The observation scale is a log-linear function of a small daily basis and
+  # the degree-day terms, so predictive variance follows the covariates. The
+  # coefficient priors are kept tight: the exp link compounds, and loose
+  # scales hand the sampler a pathological geometry.
+  heteroskedastic: true
+  variance_daily_harmonics: 3
+  variance_use_degree_days: true
   priors:
     level_scale: 0.1 # HalfNormal, per-step level innovation
     slope_scale: 0.01 # HalfNormal, per-step slope innovation
     damping_alpha: 8.0 # Beta prior on the slope damping factor
     damping_beta: 2.0
     coef_scale: 1.0 # Normal, regression coefficients
-    obs_scale: 0.5 # HalfNormal, observation noise
+    obs_scale: 0.5 # HalfNormal, observation noise when homoskedastic
+    var_intercept_loc: -1.5 # Normal, log observation scale at baseline
+    var_intercept_scale: 0.7
+    var_coef_scale: 0.25 # Normal, log-variance coefficients
     init_level_scale: 2.0
     init_slope_scale: 0.1
     student_t_df_rate: 0.1 # Exponential rate for (df - 2) under student_t

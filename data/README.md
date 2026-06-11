@@ -43,12 +43,16 @@ interpolated to the half-hourly grid during preprocessing.
   tail for recent months. Used to train the demand-weather relationship and
   to score forecasts. Contains modelled reanalysis, not station observations.
 - **Forecasts as issued:** Previous Runs API
-  (`previous-runs-api.open-meteo.com/v1/forecast`), model
-  `bom_access_global` (the Bureau of Meteorology's ACCESS-G), variable
-  `temperature_2m_previous_day1`. Each timestamp carries the value predicted
-  for it by the run initialised one day earlier, so day-ahead covariates have
-  no look-ahead. Occasional missing runs appear as gaps and are handled in
-  preprocessing.
+  (`previous-runs-api.open-meteo.com/v1/forecast`), model `ecmwf_ifs025`,
+  variables `temperature_2m`, `direct_normal_irradiance` and
+  `diffuse_radiation`, each at the `previous_day1` offset. Every timestamp
+  carries the value predicted for it by the run initialised one day earlier,
+  so day-ahead covariates have no look-ahead. The Bureau's ACCESS-G
+  (`bom_access_global`) would have been the natural operational choice but
+  its previous-runs archive is empty over this window (checked at download
+  time: zero non-null hours after July 2025), so the ECMWF IFS 0.25 degree
+  archive is used instead. Occasional missing runs appear as gaps and are
+  handled in preprocessing.
 - **Known mismatch:** weather coefficients are trained on ERA5 actuals while
   operational covariates come from ACCESS-G, which carries different biases.
   This mild train/serve mismatch is acknowledged in the notebooks; bias
