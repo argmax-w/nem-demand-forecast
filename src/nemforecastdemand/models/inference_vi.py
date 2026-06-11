@@ -27,13 +27,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from numpyro.infer import SVI, Trace_ELBO, autoguide
+from numpyro.infer import SVI, Trace_ELBO, autoguide, init_to_median
 
 from nemforecastdemand.config import ViConfig
 from nemforecastdemand.evaluation.diagnostics import ElboTrace
 from nemforecastdemand.utils import tree_to_float32
 
 GUIDE_KINDS = ("meanfield", "fullrank")
+
+#: Per-family optimisation settings. Both guides start at the prior medians:
+#: the default uniform(-2, 2) start can place the log-variance intercept deep
+#: in its clipped tail, where the initial loss is astronomically large and
+#: the first Adam steps blow the full-rank Cholesky apart. The full-rank
+#: factor also needs a halved learning rate and tight gradient clipping; the
+#: mean-field guide tolerates brisker settings.
+GUIDE_SETTINGS = {
+    "meanfield": {"lr_scale": 1.0, "clip": 10.0, "init_scale": 0.1},
+    "fullrank": {"lr_scale": 0.5, "clip": 1.0, "init_scale": 0.01},
+}
 
 
 @dataclass
@@ -60,17 +71,16 @@ class ViFit:
 
 
 def make_guide(kind: str, model_fn: Callable) -> autoguide.AutoGuide:
-    """Construct the surrogate family.
-
-    The full-rank guide starts with a smaller initial scale: with several
-    thousand latent dimensions its early ELBO is dominated by the prior
-    volume, and a wide start makes the first optimisation steps erratic.
-    """
-    if kind == "meanfield":
-        return autoguide.AutoNormal(model_fn, init_scale=0.1)
-    if kind == "fullrank":
-        return autoguide.AutoMultivariateNormal(model_fn, init_scale=0.02)
-    raise ValueError(f"unknown guide kind {kind!r}, expected one of {GUIDE_KINDS}")
+    """Construct the surrogate family with a prior-median start."""
+    if kind not in GUIDE_SETTINGS:
+        raise ValueError(f"unknown guide kind {kind!r}, expected one of {GUIDE_KINDS}")
+    settings = GUIDE_SETTINGS[kind]
+    cls = autoguide.AutoNormal if kind == "meanfield" else autoguide.AutoMultivariateNormal
+    return cls(
+        model_fn,
+        init_loc_fn=init_to_median(num_samples=50),
+        init_scale=settings["init_scale"],
+    )
 
 
 def _gaussian_entropy(params: dict) -> jnp.ndarray:
@@ -117,12 +127,13 @@ def fit_advi(
         compilation separated from optimisation.
     """
     guide = make_guide(kind, model_fn)
+    settings = GUIDE_SETTINGS[kind]
     schedule = optax.exponential_decay(
-        init_value=vi.learning_rate,
+        init_value=vi.learning_rate * settings["lr_scale"],
         transition_steps=max(vi.steps // 4, 1),
         decay_rate=0.5,
     )
-    optimiser = optax.chain(optax.clip_by_global_norm(10.0), optax.adam(schedule))
+    optimiser = optax.chain(optax.clip_by_global_norm(settings["clip"]), optax.adam(schedule))
     svi = SVI(model_fn, guide, optimiser, Trace_ELBO(num_particles=vi.num_particles))
     eval_elbo = Trace_ELBO(num_particles=vi.eval_particles)
 
