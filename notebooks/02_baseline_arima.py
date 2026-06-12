@@ -109,7 +109,7 @@ ax.bar(edges[:-1], density, width=np.diff(edges), align="edge", color=palette("f
 ax.axhline(1.0, color="grey", lw=0.8)
 ax.set_xlabel("PIT")
 ax.set_ylabel("relative density")
-ax.set_title("Validation PIT: wide at the centre, escaping upper tail")
+ax.set_title("Validation PIT: heavy centre, light upper tail")
 plt.show()
 
 # %% [markdown]
@@ -158,13 +158,15 @@ scores.round(3)
 
 # %% [markdown]
 # Three observations worth carrying forward. First, the model beats the
-# seasonal naive by a wide margin on every metric, so the machinery is
-# earning its keep. Second, perfect foresight buys only a modest CRPS
-# improvement over the archived forecast: at one day ahead, ECMWF weather
-# error is a minor part of the demand-forecast error budget. Third, the
-# coverage columns report how honest the single Gaussian variance manages
-# to be across a test period that ramps into early winter; the
-# heteroskedastic BSTS attacks that weakness structurally.
+# seasonal naive by more than a hundred megawatts of CRPS, so the
+# machinery is earning its keep. Second, perfect foresight buys only a
+# modest improvement over the archived forecast (267 against 260 MW): at
+# one day ahead, ECMWF weather error is a minor part of the
+# demand-forecast error budget. Third, the bands over-cover at the centre
+# (the 50% interval catches two thirds of outcomes) while the tails sit
+# at nominal: one variance for all hours has to be wide enough for the
+# evening peak, so it is too wide for the small hours. That centre-tail
+# mismatch is precisely the opening for the heteroskedastic BSTS.
 
 # %%
 fig, ax = plt.subplots(figsize=(7.5, 4))
@@ -258,8 +260,10 @@ pd.Series(
 #   richer orders add parameters, not validation skill.
 # - The trigonometric and RBF seasonal bases tie, confirming notebook 01;
 #   the harmonics remain the project default.
-# - The baseline beats the seasonal naive decisively and loses little when
-#   moving from perfect-foresight weather to the real archived forecast.
+# - The baseline beats the seasonal naive decisively (267 against 372 MW
+#   CRPS) and loses little when moving from perfect-foresight weather to
+#   the real archived forecast.
 # - A single Gaussian variance has to average over easy small hours and
-#   hard evening peaks alike; a state-dependent variance is precisely the
-#   opening the heteroskedastic BSTS exploits.
+#   hard evening peaks alike, so it over-covers at the centre even with
+#   nominal tails; a covariate-driven variance is precisely the opening
+#   the heteroskedastic BSTS exploits.

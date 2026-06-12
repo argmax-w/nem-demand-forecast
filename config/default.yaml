@@ -69,6 +69,15 @@ arima:
     - [3, 0, 2]
     - [4, 0, 2]
 
+# Bayesian additive regression trees: the Bayesian counterpart to the
+# LightGBM benchmark. Trees are discrete, so the model is fitted by its
+# native particle-Gibbs sampler rather than ADVI or NUTS.
+bart:
+  trees: 50
+  tune: 1000
+  draws: 1000
+  chains: 4
+
 bsts:
   damped_slope: true
   obs_family: gaussian # gaussian | student_t

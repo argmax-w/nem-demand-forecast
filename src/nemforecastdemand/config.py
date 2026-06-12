@@ -99,6 +99,16 @@ class BstsPriors:
 
 
 @dataclass(frozen=True)
+class BartConfig:
+    """Bayesian additive regression trees settings."""
+
+    trees: int
+    tune: int
+    draws: int
+    chains: int
+
+
+@dataclass(frozen=True)
 class BstsConfig:
     """Structural model settings."""
 
@@ -186,6 +196,7 @@ class Config:
     weather: WeatherConfig
     features: FeatureConfig
     arima: ArimaConfig
+    bart: BartConfig
     bsts: BstsConfig
     vi: ViConfig
     nuts: NutsConfig
@@ -248,6 +259,12 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         arima=ArimaConfig(
             candidate_orders=_as_int_triples(raw["arima"]["candidate_orders"]),
+        ),
+        bart=BartConfig(
+            trees=int(raw["bart"]["trees"]),
+            tune=int(raw["bart"]["tune"]),
+            draws=int(raw["bart"]["draws"]),
+            chains=int(raw["bart"]["chains"]),
         ),
         bsts=BstsConfig(
             damped_slope=bool(raw["bsts"]["damped_slope"]),
