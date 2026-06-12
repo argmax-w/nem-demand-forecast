@@ -1,8 +1,8 @@
 """Fit the LightGBM quantile benchmark and write its forecasts to artifacts.
 
-Heads are trained on origin blocks over the training split — the shared
+Heads are trained on origin blocks over the training split (the shared
 design plus the origin-anchored recency features, mirroring the
-operational setting — with early stopping on the validation split's
+operational setting) with early stopping on the validation split's
 blocks (which the trees otherwise never see), then produce rolling-origin
 test forecasts under every weather-input variant. Each model is run the
 way a practitioner would run it.

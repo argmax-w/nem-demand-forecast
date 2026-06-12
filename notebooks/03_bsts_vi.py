@@ -14,12 +14,18 @@
 # ---
 
 # %% [markdown]
-# # 03. The Bayesian structural time-series model, fitted by ADVI
+# # 03. The Bayesian model, its failure and its repair, fitted by ADVI
 #
-# The generative model is defined once in `nemforecastdemand.models.bsts`
-# and shared with notebook 04, which fits it by NUTS; everything that
-# differs between these notebooks is the inference algorithm. On demand
-# standardised over the fitting window:
+# **Goal.** Fit the structural time-series model by mean-field and
+# full-rank ADVI, use the exact variance decomposition to diagnose why it
+# loses to the seasonal naive at the 48-step horizon, and fit the repaired
+# model the diagnosis points to: the same regression with a stationary
+# AR(1) error in innovations form. Notebook 04 adjudicates the surrogates
+# against NUTS; notebook 05 compares all models.
+#
+# ## The trend formulation, states marginalised
+#
+# On demand standardised over the fitting window:
 #
 # $$
 # \begin{aligned}
@@ -31,50 +37,29 @@
 # \end{aligned}
 # $$
 #
-# a stochastic local linear trend with damped slope, static regression on
-# the shared design $x_t$ (seasonal harmonics on local-clock phases,
-# temperature, dew point, irradiance, degree days, demand lags, holiday) and
-# a log-linear observation scale in a small variance design $z_t$ (three
-# daily harmonics plus degree days), so predictive spread follows the
-# covariates. Priors are weakly informative on the standardised scale:
-# half-normal innovation scales (0.1 and 0.01: trend moves slowly at half
-# hours), Beta(8, 2) damping, unit-scale Gaussian coefficients and tight
-# Gaussians on the variance head, whose exponential link punishes loose
-# priors with pathological geometry.
+# a local linear trend with damped slope, regression on the shared design
+# $x_t$ and a log-linear scale on the small variance design $z_t$.
+# Conditional on the hyperparameters the trend is linear-Gaussian, so a
+# Kalman filter inside the likelihood integrates the states out exactly
+# and inference runs over roughly fifty hyperparameters however long the
+# data. Sampling the states instead costs two dimensions per half hour:
+# tried on a 56-day window, cold NUTS did not finish 2,000 iterations in
+# seventeen hours and the full-rank guide diverged. Marginalisation fixes
+# the dimension problem but leaves a sequential filter inside every
+# gradient; that cost returns in notebook 04's hardware benchmarks.
 #
-# **The states are marginalised, not sampled.** Conditional on the
-# hyperparameters the trend is linear-Gaussian, so a Kalman filter inside
-# the likelihood integrates the state path out exactly and inference works
-# over roughly fifty hyperparameters however long the data. The naive
-# alternative, sampling every half hour's innovations as latent draws,
-# costs two dimensions per half hour, caps the affordable window at a few
-# weeks and defeats most of the toolkit; when it was attempted here, cold
-# NUTS did not complete 2,000 iterations in seventeen hours on the GPU and
-# the full-rank guide diverged, a dense Cholesky over thousands of
-# dimensions being underdetermined at any setting. Marginalisation removes
-# the dimension problem at the price of a sequential filter inside every
-# gradient, and the full training year is affordable for every inference
-# path. The same filter drives prediction: forecasts condition on all
-# demand up to each origin and simulate forward, with no per-origin
-# refitting.
+# ## ADVI, ELBO watched in parts
 #
-# **ADVI.** Automatic-differentiation variational inference maximises the
-# evidence lower bound over a Gaussian surrogate $q$ in the unconstrained
-# space, and the ELBO splits exactly as
+# ADVI maximises the evidence lower bound over a Gaussian surrogate $q$,
+# which splits exactly as
 #
 # $$ \mathrm{ELBO} = \underbrace{\mathbb{E}_q[\log p(y, \theta)]}_{\text{energy}}
 #    + \underbrace{\mathbb{H}[q]}_{\text{entropy}}, $$
 #
-# energy rewarding mass where the model has it and entropy rewarding spread
-# (the energy term absorbs the Jacobian of the constraining transforms; the
-# entropy of a Gaussian surrogate is closed form). Watching the two parts
-# separately shows *how* the surrogate converges: under-dispersion appears
-# as entropy collapsing while energy still climbs. Two families are
-# fitted: **mean-field** (`AutoNormal`, independent Gaussians) and
-# **full-rank** (`AutoMultivariateNormal`, one joint Gaussian whose
-# covariance can carry the posterior correlations mean-field must
-# discard). At fifty-odd dimensions the full covariance is a
-# well-determined object.
+# so under-dispersion is visible during training as entropy collapsing
+# while energy climbs. Two families throughout: mean-field (`AutoNormal`)
+# and full-rank (`AutoMultivariateNormal`), whose covariance can carry
+# the correlations mean-field discards.
 
 # %%
 import os
@@ -89,7 +74,10 @@ from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_splits
 from nemforecastdemand.evaluation.metrics import crps_gaussian, crps_samples
 from nemforecastdemand.models import bsts
-from nemforecastdemand.models.predict import variance_decomposition
+from nemforecastdemand.models.predict import (
+    variance_decomposition,
+    variance_decomposition_innovations,
+)
 from nemforecastdemand.plotting import fan_chart, palette, save_figure, setup_style
 from nemforecastdemand.splits import rolling_origins
 from nemforecastdemand.utils import load_artifact
@@ -100,46 +88,200 @@ splits = load_splits(cfg.paths.processed)
 panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 max_lag = max(cfg.features.demand_lags)
 
-fits = {
+trend_fits = {
     kind: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{kind}")
     for kind in ("meanfield", "fullrank")
 }
+ar_fits = {
+    kind: load_artifact(cfg.paths.artifacts / f"bsts_innovations_vi_{kind}")
+    for kind in ("meanfield", "fullrank")
+}
+trend_nuts, trend_nuts_meta = load_artifact(cfg.paths.artifacts / "bsts_collapsed_nuts_cold")
+arima_arrays, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
+
 test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
 fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
 inputs = bsts.prepare_inputs(panel, cfg, fit_index)
+y_test = trend_fits["meanfield"][0]["y_test"]
+colours = {"meanfield": palette("demand"), "fullrank": palette("accent")}
 
-SITES = tuple(s for s in bsts.HYPER_SITES if s not in ("level_init", "slope_init"))
+TREND_SITES = tuple(s for s in bsts.HYPER_SITES if s not in ("level_init", "slope_init"))
+AR_SITES = ("rho", "beta", "gamma0", "gamma")
 
 
-def draws_of(kind: str) -> dict[str, np.ndarray]:
-    """Hyperparameter draws with the marginalised init sites at their prior mean."""
-    arrays = fits[kind][0]
-    draws = {site: arrays[f"draw_{site}"] for site in SITES}
+def trend_draws(kind: str) -> dict[str, np.ndarray]:
+    """Trend-model draws with the marginalised init sites at their prior mean."""
+    arrays = trend_fits[kind][0]
+    draws = {site: arrays[f"draw_{site}"] for site in TREND_SITES}
     zeros = np.zeros(draws["sigma_level"].shape[0], dtype=np.float32)
     return {**draws, "level_init": zeros, "slope_init": zeros}
 
 
+def ar_draws(kind: str) -> dict[str, np.ndarray]:
+    return {site: ar_fits[kind][0][f"draw_{site}"] for site in AR_SITES}
+
+
+def per_horizon_crps(paths: np.ndarray) -> np.ndarray:
+    """Mean CRPS at each lead time from sampled paths, (H,)."""
+    return np.stack(
+        [crps_samples(y_test[:, h], paths[:, :, h]).mean() for h in range(cfg.horizon)]
+    )
+
+
 # %% [markdown]
-# ## ELBO convergence, decomposed
+# ## Diagnosis: where the trend model puts its variance
 #
-# Both surrogates are optimised with Adam (20,000 steps, exponentially
-# decayed learning rate, gradient clipping); the ELBO is re-estimated with
-# 64 particles at every checkpoint so the curves below are not just
-# single-sample noise.
+# Mean-field, full-rank and NUTS agree on this model's forecasts to within
+# half a percent, so the failure is the model, not the inference. The
+# posterior shrinks the level innovation to nothing and inflates the slope
+# innovation to roughly five percent of a standard deviation per half
+# hour, damped at $\phi \approx 0.76$. A heavily damped, heavily driven
+# slope is a wiggle-tracker: excellent filtering (its one-step CRPS beats
+# every model in the project) but slope noise integrates into the level,
+# so by 48 steps the spread passes 2,000 MW where ARIMA sits near 700 and
+# the CRPS crosses ARIMA's at the third half hour.
+
+# %%
+sigma_slope = trend_nuts["post_sigma_slope"].ravel()
+phi = trend_nuts["post_phi"].ravel()
+pd.DataFrame(
+    {
+        "posterior mean": [
+            trend_nuts["post_sigma_level"].ravel().mean() * inputs.y_scale,
+            sigma_slope.mean() * inputs.y_scale,
+            phi.mean(),
+        ],
+        "prior scale": [
+            cfg.bsts.priors.level_scale * inputs.y_scale,
+            cfg.bsts.priors.slope_scale * inputs.y_scale,
+            np.nan,
+        ],
+    },
+    index=["sigma_level (MW/step)", "sigma_slope (MW/step)", "phi (damping)"],
+).round(2)
+
+# %%
+trend_curve = per_horizon_crps(trend_nuts["forecast_paths"])
+arima_curve = np.stack(
+    [
+        crps_gaussian(
+            y_test[:, h], arima_arrays["forecast_mean"][:, h], arima_arrays["forecast_sd"][:, h]
+        ).mean()
+        for h in range(cfg.horizon)
+    ]
+)
+trend_sd = trend_nuts["forecast_paths"].std(axis=0).mean(axis=0)
+hours = (np.arange(cfg.horizon) + 1) / 2
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(hours, trend_curve, color=palette("demand"), label="trend BSTS (NUTS)")
+axes[0].plot(hours, arima_curve, color=palette("neutral"), label="ARIMA")
+axes[0].set_title("CRPS by lead time")
+axes[0].set_ylabel("CRPS (MW)")
+axes[1].plot(hours, trend_sd, color=palette("demand"), label="trend BSTS")
+axes[1].plot(
+    hours, arima_arrays["forecast_sd"].mean(axis=0), color=palette("neutral"), label="ARIMA"
+)
+axes[1].set_title("Mean predictive spread by lead time")
+axes[1].set_ylabel("sd (MW)")
+for ax in axes:
+    ax.set_xlabel("lead time (hours)")
+    ax.legend()
+fig.suptitle("The trend model filters well and extrapolates badly", y=1.03)
+save_figure(fig, "trend_model_diagnosis", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# The variance decomposition attributes the blow-up. Given a draw the
+# model is linear-Gaussian, so predictive variance splits exactly into
+# **parameter** and **state** (epistemic) plus **process** and
+# **observation** (aleatoric). A sane day-ahead model is dominated by the
+# observation term; this one is dominated by process noise. Scores say
+# the model is bad, the decomposition says which component did it.
+
+# %%
+trend_decomp = {
+    kind: variance_decomposition(trend_draws(kind), inputs, panel, cfg, test_origins)
+    for kind in trend_fits
+}
+
+component_order = ["observation", "process", "state", "parameter"]
+component_colours = {
+    "observation": "#cccccc",
+    "process": "#969696",
+    "state": "#8fc1e3",
+    "parameter": "#1f5673",
+}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+for ax, kind in zip(axes, trend_fits, strict=True):
+    parts = trend_decomp[kind]
+    total = sum(parts.values())
+    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
+    ax.stackplot(
+        hours,
+        shares,
+        labels=component_order,
+        colors=[component_colours[n] for n in component_order],
+        alpha=0.95,
+    )
+    ax.set_title(f"trend model, {kind}")
+    ax.set_xlabel("lead time (hours)")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(hours[0], hours[-1])
+axes[0].set_ylabel("share of predictive variance")
+axes[1].legend(loc="center right", fontsize=8)
+fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.03)
+save_figure(fig, "bsts_vi_variance_decomposition", cfg.paths.figures)
+plt.show()
+
+# %%
+rows = {}
+for kind in trend_fits:
+    parts = trend_decomp[kind]
+    total = sum(parts.values())
+    rows[kind] = {f"{name} share": float((parts[name] / total).mean()) for name in component_order}
+    rows[kind]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
+pd.DataFrame(rows).T.round(3)
+
+# %% [markdown]
+# ## Repair: a stationary error in innovations form
+#
+# Order selection in notebook 02 chose ARIMA(1, 0, 1): stationary
+# short-memory errors around the regression, no integrated trend. The
+# repair gives the Bayesian model the same structure,
+#
+# $$ e_t = y_t - x_t^\top \beta, \qquad
+#    e_t - \rho\, e_{t-1} \sim \mathcal{N}(0, \sigma_t^2), \qquad
+#    \log \sigma_t = \gamma_0 + z_t^\top \gamma, $$
+#
+# with the first residual at its stationary distribution and a Beta(8, 2)
+# prior on $\rho$. Writing the likelihood on the innovations has two
+# consequences. Nothing is sequential: residuals are one matrix product,
+# innovations a shifted difference, so the scan disappears from every
+# gradient. And because the error is first-order Markov, prediction
+# conditions on the observed residual at the origin; no filter, and the
+# state term of the decomposition is structurally zero.
+#
+# Two honesty notes. The revision was motivated by the trend model's test
+# failure, a post-hoc structural repair; nothing in it was tuned on test
+# (structure follows the validation-selected ARIMA order, priors were
+# fixed before fitting, inference settings carry over). And the trend
+# model reaches a *higher* ELBO, because the wiggle-tracking slope buys
+# one-step density: in-sample evidence does not select for 48-step
+# forecasting, which is why rolling test origins decide.
 
 # %%
 fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-colours = {"meanfield": palette("demand"), "fullrank": palette("accent")}
-for kind, (arrays, _meta) in fits.items():
+for kind, (arrays, _meta) in ar_fits.items():
     axes[0].plot(arrays["elbo_steps"], arrays["elbo"], color=colours[kind], label=kind)
     axes[1].plot(arrays["elbo_steps"], arrays["energy"], color=colours[kind])
     axes[2].plot(arrays["elbo_steps"], arrays["entropy"], color=colours[kind])
 for ax, title in zip(axes, ("ELBO", "energy", "entropy"), strict=True):
     ax.set_title(title)
     ax.set_xlabel("step")
-axes[0].set_ylim(bottom=np.quantile(fits["meanfield"][0]["elbo"], 0.05))
+axes[0].set_ylim(bottom=np.quantile(ar_fits["meanfield"][0]["elbo"], 0.05))
 axes[0].legend()
-fig.suptitle("ELBO = energy + entropy, per optimisation step", y=1.03)
+fig.suptitle("Innovations model ELBO = energy + entropy, per optimisation step", y=1.03)
 save_figure(fig, "elbo_decomposition", cfg.paths.figures)
 plt.show()
 
@@ -154,39 +296,34 @@ def plateau_drift(elbo: np.ndarray, window: int = 20) -> str:
 
 pd.DataFrame(
     {
-        kind: {
+        f"{model} {kind}": {
             "final ELBO": meta["final_elbo"],
-            "final entropy": float(arrays["entropy"][-1]),
             "plateau drift, last 2k steps": plateau_drift(arrays["elbo"]),
             "fit seconds": meta["timings_seconds"]["fit_seconds"],
-            "steps per second": meta["timings_seconds"]["steps_per_second"],
             "device": meta["device"],
         }
+        for model, fits in (("trend", trend_fits), ("AR", ar_fits))
         for kind, (arrays, meta) in fits.items()
     }
 ).T
 
 # %% [markdown]
-# The energy curves show whether both families find the same posterior
-# mass; the entropy curves are where a factorised Gaussian pays for the
-# correlations it discards, settling lower than a family that can carry
-# them. The decomposition makes that visible during training rather than
-# after the fact.
+# The cost column is the second dividend: the same optimiser and step
+# budget that needed close to an hour against the Kalman scan finishes in
+# seconds without it.
 #
-# ## Where mean-field under-estimates variance
+# ## What the two surrogate families disagree about
 #
-# With both surrogates fitted to the same model, the marginal standard
-# deviations of the hyperparameters compare directly, and the full-rank
-# covariance shows which correlations the mean-field family had to
-# discard. Which family is closer to the truth is settled by the NUTS
-# reference posterior in notebook 04.
+# Persistence and the variance head trade off against the regression (a
+# larger $\rho$ carries more of each residual, demanding less of
+# $\beta$), so this posterior is where mean-field should under-disperse.
+# Notebook 04 settles which family is right.
 
 # %%
-hyper_names = ["sigma_level", "sigma_slope", "phi", "gamma0"]
 rows = {}
-for name in hyper_names:
-    mf = fits["meanfield"][0][f"draw_{name}"]
-    fr = fits["fullrank"][0][f"draw_{name}"]
+for name in ("rho", "gamma0"):
+    mf = ar_fits["meanfield"][0][f"draw_{name}"]
+    fr = ar_fits["fullrank"][0][f"draw_{name}"]
     rows[name] = {
         "mean (MF)": mf.mean(),
         "sd (MF)": mf.std(),
@@ -196,9 +333,9 @@ for name in hyper_names:
 pd.DataFrame(rows).T.round(4)
 
 # %%
-labels = ["sigma_level", "sigma_slope", "phi", "gamma0"]
-draws_fr = np.column_stack([fits["fullrank"][0][f"draw_{name}"] for name in labels])
-beta_fr = fits["fullrank"][0]["draw_beta"]
+labels = ["rho", "gamma0"]
+draws_fr = np.column_stack([ar_fits["fullrank"][0][f"draw_{name}"] for name in labels])
+beta_fr = ar_fits["fullrank"][0]["draw_beta"]
 lag_cols = [i for i, c in enumerate(inputs.columns) if "lag" in c]
 draws_fr = np.column_stack([draws_fr, beta_fr[:, lag_cols]])
 labels = labels + [inputs.columns[i] for i in lag_cols]
@@ -213,39 +350,27 @@ ax.set_title("Correlations the mean-field family cannot represent")
 plt.show()
 
 # %% [markdown]
-# ## The filtered trend and the learned variance profile
+# ## Persistence and the learned variance profile
 #
-# The level component absorbs what the regression cannot explain: slow
-# drift in the demand baseline across the year. The variance head learns
-# the daily rhythm of predictability, narrow bands in the small hours and
-# wide bands across the afternoon and evening, which is exactly what the
-# homoskedastic baseline could not express.
+# The AR coefficient lands deep in the persistent regime and the variance
+# head keeps the daily risk profile: narrow bands in the small hours, wide
+# bands across the afternoon and evening ramps. The homoskedastic
+# ablation in notebooks 04 and 05 switches this head off to price it.
 
 # %%
-filtered_mean, _ = bsts.kalman_filter_states(
-    draws_of("meanfield"), inputs.y, inputs.x_mean, inputs.x_var, cfg.bsts
-)
-level_mw = filtered_mean[:, :, 0] * inputs.y_scale + inputs.y_loc
-times = fit_index.tz_convert("Australia/Brisbane")
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-axes[0].fill_between(
-    times,
-    np.quantile(level_mw, 0.05, axis=0),
-    np.quantile(level_mw, 0.95, axis=0),
-    color=palette("demand"),
-    alpha=0.25,
-    label="90% band over draws",
-)
-axes[0].plot(times, level_mw.mean(axis=0), color=palette("demand"), lw=0.9, label="mean")
-axes[0].set_title("Filtered trend level, mean-field draws")
-axes[0].set_ylabel("MW")
-axes[0].legend()
-
 local_hour = fit_index.tz_convert("Australia/Sydney")
 hour_frac = local_hour.hour + local_hour.minute / 60
-for kind in fits:
-    arrays = fits[kind][0]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for kind in ar_fits:
+    rho_draws = ar_fits[kind][0]["draw_rho"]
+    axes[0].hist(rho_draws, bins=40, density=True, alpha=0.55, color=colours[kind], label=kind)
+axes[0].set_title("Posterior of the AR(1) persistence")
+axes[0].set_xlabel("rho")
+axes[0].legend()
+
+for kind in ar_fits:
+    arrays = ar_fits[kind][0]
     gamma0 = arrays["draw_gamma0"][:, None]
     gamma = arrays["draw_gamma"]
     log_sigma = gamma0 + gamma @ inputs.x_var.T
@@ -254,7 +379,7 @@ for kind in fits:
         pd.DataFrame({"hour": hour_frac, "sigma": sigma_mw.mean(axis=0)}).groupby("hour").mean()
     )
     axes[1].plot(profile.index, profile["sigma"], color=colours[kind], label=kind)
-axes[1].set_title("Learned observation scale by local hour")
+axes[1].set_title("Learned innovation scale by local hour")
 axes[1].set_xlabel("local Sydney hour")
 axes[1].set_ylabel("sigma (MW)")
 axes[1].set_xticks(np.arange(0, 25, 3))
@@ -264,28 +389,32 @@ save_figure(fig, "bsts_trend_and_variance", cfg.paths.figures)
 plt.show()
 
 # %% [markdown]
-# ## Posterior predictive forecasts
+# ## Forecasts, before and after
 #
-# Forecasts are Rao-Blackwellised: conditional on each hyperparameter draw
-# the model is linear-Gaussian, so a Kalman filter conditions on all demand
-# up to each origin and the horizon is then simulated forward, one jointly
-# coherent 48-step path per posterior draw. CRPS uses the energy-form
-# sample estimator (unit-tested against the analytic Gaussian form used for
-# the baseline).
+# Forecasts carry the observed origin residual forward under each draw's
+# $\rho$, innovations accumulating at the covariate-driven scale: one
+# coherent 48-step path per draw. CRPS uses the energy-form sample
+# estimator, unit-tested against the analytic Gaussian form.
 
 # %%
-arima_arrays, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
-y_test = fits["meanfield"][0]["y_test"]
-
 crps_rows = {}
-for kind, (arrays, _meta) in fits.items():
-    per_origin = np.stack(
+for kind, (arrays, _meta) in ar_fits.items():
+    crps_rows[f"AR innovations, ADVI {kind}"] = float(
+        np.mean(
+            [
+                crps_samples(y_test[i], arrays["forecast_paths"][:, i, :]).mean()
+                for i in range(y_test.shape[0])
+            ]
+        )
+    )
+crps_rows["trend model, NUTS"] = float(
+    np.mean(
         [
-            crps_samples(y_test[i], arrays["forecast_paths"][:, i, :]).mean()
+            crps_samples(y_test[i], trend_nuts["forecast_paths"][:, i, :]).mean()
             for i in range(y_test.shape[0])
         ]
     )
-    crps_rows[f"BSTS ADVI {kind}"] = per_origin.mean()
+)
 crps_rows["ARIMA baseline"] = float(
     crps_gaussian(
         arima_arrays["y_test"], arima_arrays["forecast_mean"], arima_arrays["forecast_sd"]
@@ -294,9 +423,22 @@ crps_rows["ARIMA baseline"] = float(
 pd.Series(crps_rows, name="test CRPS (MW), archived forecast weather").to_frame().round(1)
 
 # %%
-mf_paths = fits["meanfield"][0]["forecast_paths"]
+ar_curve = per_horizon_crps(ar_fits["fullrank"][0]["forecast_paths"])
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(hours, trend_curve, color=palette("demand"), ls="--", label="trend BSTS")
+ax.plot(hours, ar_curve, color=palette("demand"), label="AR innovations (full-rank ADVI)")
+ax.plot(hours, arima_curve, color=palette("neutral"), label="ARIMA")
+ax.set_xlabel("lead time (hours)")
+ax.set_ylabel("CRPS (MW)")
+ax.set_title("The repair, horizon by horizon")
+ax.legend()
+save_figure(fig, "bsts_repair_by_horizon", cfg.paths.figures)
+plt.show()
+
+# %%
+fr_paths = ar_fits["fullrank"][0]["forecast_paths"]
 daily_crps = np.stack(
-    [crps_samples(y_test[i], mf_paths[:, i, :]).mean() for i in range(y_test.shape[0])]
+    [crps_samples(y_test[i], fr_paths[:, i, :]).mean() for i in range(y_test.shape[0])]
 )
 typical = int(np.argsort(daily_crps)[len(daily_crps) // 2])
 worst = int(daily_crps.argmax())
@@ -308,9 +450,9 @@ for ax, pos, title in ((axes[0], typical, "median origin"), (axes[1], worst, "wo
     fan_chart(
         ax,
         index,
-        samples=mf_paths[:, pos, :],
+        samples=fr_paths[:, pos, :],
         colour=palette("demand"),
-        label="mean-field predictive",
+        label="full-rank predictive",
     )
     ax.plot(
         index.tz_convert("Australia/Brisbane"), y_test[pos], color="black", lw=1.0, label="observed"
@@ -322,97 +464,63 @@ save_figure(fig, "bsts_vi_fan_charts", cfg.paths.figures)
 plt.show()
 
 # %% [markdown]
-# ## Aleatoric against epistemic uncertainty
+# ## The decomposition after the repair
 #
-# Because the model is linear-Gaussian given a hyperparameter draw, the
-# predictive variance splits exactly (law of total variance) into four
-# named sources: **parameter** (posterior spread of the per-draw
-# predictive means) and **state** (how well the level and slope at the
-# origin are pinned down) are epistemic, shrinking with more data;
-# **process** (future trend innovations) and **observation** (the
-# heteroskedastic noise floor) are aleatoric, irreducible under the model.
-# The split is computed analytically per draw, no simulation involved.
-#
-# The fractions are diagnostic for the inference comparison too: a
-# surrogate that under-states posterior spread must report a smaller
-# epistemic share, so the gap between the two guides previews what the
-# NUTS adjudication in notebook 04 makes precise.
+# Two components now. The origin residual is observed, so the state term
+# is structurally zero and process plus observation merge into one
+# **innovation** term that accumulates towards the stationary error
+# variance as $\rho^{2h}$ decays; **parameter** spread is all the
+# epistemic uncertainty there is. The epistemic share doubles as an
+# inference diagnostic: an under-dispersed surrogate must under-state it,
+# which notebook 04 checks against NUTS.
 
 # %%
-decomp = {
-    kind: variance_decomposition(draws_of(kind), inputs, panel, cfg, test_origins) for kind in fits
+ar_decomp = {
+    kind: variance_decomposition_innovations(ar_draws(kind), inputs, panel, cfg, test_origins)
+    for kind in ar_fits
 }
 
-component_order = ["observation", "process", "state", "parameter"]
-component_colours = {
-    "observation": "#cccccc",
-    "process": "#969696",
-    "state": "#8fc1e3",
-    "parameter": "#1f5673",
-}
-hours = (np.arange(cfg.horizon) + 1) / 2
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
-for ax, kind in zip(axes, fits, strict=True):
-    parts = decomp[kind]
-    total = sum(parts.values())
-    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
-    ax.stackplot(
+fig, ax = plt.subplots(figsize=(7, 4))
+for kind, ls in (("meanfield", "--"), ("fullrank", "-")):
+    parts = ar_decomp[kind]
+    total = parts["parameter"] + parts["innovation"]
+    ax.plot(
         hours,
-        shares,
-        labels=component_order,
-        colors=[component_colours[n] for n in component_order],
-        alpha=0.95,
+        (parts["parameter"] / total).mean(axis=0),
+        color=colours[kind],
+        ls=ls,
+        label=f"{kind}: parameter (epistemic) share",
     )
-    ax.set_title(kind)
-    ax.set_xlabel("lead time (hours)")
-    ax.set_ylim(0, 1)
-    ax.set_xlim(hours[0], hours[-1])
-axes[0].set_ylabel("share of predictive variance")
-axes[1].legend(loc="center right", fontsize=8)
-fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.03)
-save_figure(fig, "bsts_vi_variance_decomposition", cfg.paths.figures)
+ax.set_xlabel("lead time (hours)")
+ax.set_ylabel("share of predictive variance")
+ax.set_ylim(0, None)
+ax.set_title("Epistemic share by lead time, innovations model")
+ax.legend()
+save_figure(fig, "innovations_variance_decomposition", cfg.paths.figures)
 plt.show()
 
 # %%
 rows = {}
-for kind in fits:
-    parts = decomp[kind]
-    total = sum(parts.values())
-    rows[kind] = {f"{name} share": float((parts[name] / total).mean()) for name in component_order}
-    rows[kind]["epistemic share"] = rows[kind]["state share"] + rows[kind]["parameter share"]
-    rows[kind]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
-pd.DataFrame(rows).T.round(3)
-
-# %% [markdown]
-# ## Cost
-#
-# Fit and forecast wall-clock per surrogate (the forecast time covers all
-# test origins under all six weather variants, dominated by the one-off
-# Kalman filter pass over the posterior).
-
-# %%
-pd.DataFrame(
-    {
-        kind: {
-            "fit (s)": meta["timings_seconds"]["fit_seconds"],
-            "compile (s)": meta["timings_seconds"]["compile_seconds"],
-            "forecast, all origins and variants (s)": meta["timings_seconds"]["predict_seconds"],
-            "device": meta["device"],
-        }
-        for kind, (arrays, meta) in fits.items()
+for kind in ar_fits:
+    parts = ar_decomp[kind]
+    total = parts["parameter"] + parts["innovation"]
+    rows[kind] = {
+        "parameter share": float((parts["parameter"] / total).mean()),
+        "innovation share": float((parts["innovation"] / total).mean()),
+        "mean predictive sd (MW)": float(np.sqrt(total.mean())),
     }
-).T
+pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
 # ## Summary
 #
-# - Both Gaussian families optimise stably on the marginalised geometry;
-#   the tables above quantify the entropy gap and the correlations the
-#   factorised family discards.
-# - The heteroskedastic head learns a plausible daily risk profile, and
-#   the exact variance decomposition names where predictive uncertainty
-#   comes from at each lead time.
-# - The predictive comparison against the classical baseline and the rest
-#   of the field is notebook 05's job; the adjudication of both surrogates
-#   against the NUTS reference posterior, including warm-start pricing,
-#   is notebook 04's.
+# - All three inference routes agree on the trend model's forecasts, so
+#   its failure is structural: process noise dominates the decomposition
+#   and the 48-step CRPS lands behind the seasonal naive.
+# - The innovations-form AR(1) keeps the regression and the
+#   heteroskedastic scale, replaces the trend with the stationary error
+#   the ARIMA order pointed to, fits in seconds rather than most of an
+#   hour and restores sensible horizon behaviour.
+# - The decomposition made the diagnosis specific; after the repair it
+#   reduces to a parameter/innovation split whose epistemic share
+#   notebook 04 audits against NUTS.

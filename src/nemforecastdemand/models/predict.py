@@ -277,8 +277,8 @@ def variance_decomposition_innovations(
     """Aleatoric and epistemic split for the innovations-form model, in MW².
 
     Two exact components instead of the trend models' four: ``parameter``
-    (epistemic — the origin residual is observed, so there is no state
-    term) and ``innovation`` (aleatoric — the accumulated AR-carried noise
+    (epistemic; the origin residual is observed, so there is no state
+    term) and ``innovation`` (aleatoric; the accumulated AR-carried noise
     that the trend models split between process and observation).
     """
     history = panel.index[

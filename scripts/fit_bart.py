@@ -2,8 +2,8 @@
 
 Bayesian additive regression trees, the Bayesian counterpart to the
 LightGBM benchmark: where LightGBM's quantile heads each learn their own
-function of the features, BART here learns two — a sum-of-trees mean and a
-sum-of-trees log scale over the same design — so the predictive spread
+function of the features, BART here learns two, a sum-of-trees mean and a
+sum-of-trees log scale over the same design, so the predictive spread
 adapts to the covariates exactly as freely as the quantile heads do. Tree
 structures are discrete, so neither ADVI nor NUTS applies; the model is
 fitted by its native particle-Gibbs sampler (``pymc-bart``).
@@ -11,7 +11,7 @@ fitted by its native particle-Gibbs sampler (``pymc-bart``).
 Training rows are origin blocks (the shared design plus the origin-anchored
 recency features), mirroring the operational setting, and the tree count is
 selected on the validation split before the final fit on the full pre-test
-history — the same protocol that selects the ARIMA order. The target is
+history, the same protocol that selects the ARIMA order. The target is
 standardised so the log-scale head's exp link starts at a sane magnitude.
 
 Posterior predictive draws share one function draw across a horizon, so the

@@ -14,14 +14,24 @@
 # ---
 
 # %% [markdown]
-# # 04. The same model, fitted by NUTS
+# # 04. NUTS: the reference posterior and what it costs
 #
-# Identical generative model, identical priors, identical data to notebook
-# 03; only the inference algorithm changes. This notebook is the
-# reference-posterior side of the project: NUTS with four vectorised chains
-# and a full diagnostic battery, the two ADVI surrogates adjudicated against
-# it, the warm start priced honestly and the hardware question settled. It
-# reads the artifacts of `scripts/fit_bsts_collapsed.py`.
+# **Goal.** Certify a reference posterior for the repaired (innovations
+# form) model, adjudicate the two ADVI surrogates against it, price the
+# warm starts, isolate what the heteroskedastic head buys via the
+# homoskedastic ablation and settle the GPU-versus-CPU question for both
+# likelihood formulations. Reads the artifacts of
+# `scripts/fit_bsts_innovations.py` and `scripts/fit_bsts_collapsed.py`.
+#
+# One result reshapes the whole notebook: cold NUTS on the innovations
+# model does not mix, from any reasonable warmup budget, because the
+# posterior has degenerate basins that dispersed chains fall into and
+# cannot leave. The ADVI warm start is therefore not an economy here, it
+# is what makes NUTS work at all. The trend model's collapsed likelihood
+# had the opposite profile: an expensive sequential gradient but a
+# geometry cold NUTS handled cleanly. The two formulations together make
+# the general point that likelihood design buys speed or robustness, and
+# sometimes trades one for the other.
 
 # %%
 import json
@@ -42,121 +52,161 @@ from nemforecastdemand.utils import load_artifact
 setup_style()
 cfg = load_config()
 
-cold, cold_meta = load_artifact(cfg.paths.artifacts / "bsts_collapsed_nuts_cold")
+cold, cold_meta = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_cold")
+reference, reference_meta = load_artifact(
+    cfg.paths.artifacts / "bsts_innovations_nuts_warm_fullrank_w300"
+)
+homo, homo_meta = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_homoskedastic")
 vi_fits = {
-    kind: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{kind}")
+    kind: load_artifact(cfg.paths.artifacts / f"bsts_innovations_vi_{kind}")
     for kind in ("meanfield", "fullrank")
 }
-
-# %% [markdown]
-# ## Why these are the only formulations on the table
-#
-# The marginalised likelihood is a deliberate design choice with a
-# documented motivation. Written the naive way, with every half hour's
-# level and slope innovation as a latent draw, the same model costs two
-# dimensions per half hour: a year of data would mean roughly 70,000 of
-# them, and even an eight-week window means ~5,400. On that geometry the
-# toolkit collapses. Cold NUTS (four vectorised chains, 1,000 warmup plus
-# 1,000 sampling iterations, depth-10 trees costing up to 1,023 gradient
-# evaluations per iteration per chain) was stopped after seventeen hours
-# on the RTX 4000 Ada without completing, and the full-rank guide
-# diverged, its dense Cholesky being underdetermined at thousands of
-# dimensions regardless of tuning. Those failures are findings, not
-# tuning accidents: trajectory-based samplers and dense covariances do
-# not survive thousands of correlated state dimensions.
-#
-# The Kalman filter inside the likelihood removes the problem at its
-# source: conditional on the hyperparameters the trend is linear-Gaussian,
-# so the states integrate out exactly and inference works over roughly
-# fifty hyperparameters however long the data. The cost moves from
-# dimension to gradient (a sequential filter pass inside every gradient
-# evaluation), the full training year becomes affordable for ADVI and
-# NUTS alike and the states are recovered afterwards by the same filter,
-# which is also how every prediction in this project is Rao-Blackwellised.
-
-# %% [markdown]
-# ## Sampler health
-#
-# Everything below is the collapsed model on the full training year. Split
-# R-hat and bulk and tail effective sample sizes per site (vector sites
-# report their weakest element), divergences, energy-based fraction of
-# missing information (E-BFMI) and tree-depth saturation per chain. The
-# things to look for: R-hat at 1.00, ESS comfortably in the hundreds, zero
-# or near-zero divergences, E-BFMI above 0.3 and no saturated trees.
-
-# %%
-summary = pd.DataFrame(cold_meta["site_summary"]).set_index("site")
-summary.round(4)
-
-# %%
-timing = cold_meta["timings_seconds"]
-health = pd.DataFrame(cold_meta["chain_health"]).set_index("chain")
-display_cols = pd.DataFrame(
-    {
-        "value": {
-            "warmup (s)": timing["warmup_seconds"],
-            "sampling (s)": timing["sample_seconds"],
-            "min bulk ESS": cold_meta["min_bulk_ess"],
-            "bulk ESS per second": cold_meta["min_bulk_ess"] / timing["sample_seconds"],
-            "max R-hat": cold_meta["max_rhat"],
-            "divergences": cold_meta["total_divergences"],
-        }
-    }
-)
-print(health.round(3).to_string())
-display_cols.round(3)
-
-# %% [markdown]
-# ## Traces
-#
-# Post-warmup traces and rank histograms for the structural hyperparameters.
-# Healthy chains are indistinguishable hairy caterpillars; healthy rank
-# histograms are flat.
-
-# %%
-trace_sites = ["sigma_level", "sigma_slope", "phi", "gamma0"]
-fig, axes = plt.subplots(
-    len(trace_sites), 2, figsize=(11, 2.1 * len(trace_sites)), width_ratios=[2.2, 1]
-)
 chain_colours = ["#1f5673", "#7a4988", "#c44536", "#e8a13a"]
-for row, site in enumerate(trace_sites):
-    draws = cold[f"post_{site}"]
-    ranks = draws.ravel().argsort().argsort().reshape(draws.shape)
-    for chain in range(draws.shape[0]):
-        axes[row, 0].plot(draws[chain], lw=0.4, color=chain_colours[chain], alpha=0.8)
-        axes[row, 1].hist(
-            ranks[chain],
-            bins=20,
-            histtype="step",
-            color=chain_colours[chain],
-            lw=1.0,
-        )
-    axes[row, 0].set_ylabel(site)
-axes[0, 0].set_title("post-warmup trace")
-axes[0, 1].set_title("rank histogram")
+
+# %% [markdown]
+# ## Cold NUTS finds three posteriors, none of them useful together
+#
+# Four chains from dispersed inits, the standard warmup budget. Each chain
+# mixes within itself and they disagree wildly: split R-hat in the fives,
+# bulk ESS of four. The per-chain means show why. There is an all-noise
+# basin (large $\gamma_0$: inflate the innovation scale and the regression
+# stops mattering), a near-unit-root ridge ($\rho \to 1$: differencing
+# erases the regression signal, leaving $\beta$ unidentified) and the data-
+# preferred mode. Tripling the warmup reproduces the same picture with
+# zero divergences, so this is geometry, not adaptation failure.
+
+# %%
+pd.DataFrame(cold_meta["site_summary"]).set_index("site").round(3)
+
+# %%
+pd.DataFrame(
+    {
+        "rho": cold["post_rho"].mean(axis=1).round(4),
+        "gamma0": cold["post_gamma0"].mean(axis=1).round(3),
+        "rho sd": cold["post_rho"].std(axis=1).round(5),
+    }
+).rename_axis("chain")
+
+# %%
+fig, axes = plt.subplots(2, 2, figsize=(11, 5))
+for col, (label, arrays) in enumerate((("cold", cold), ("warm full-rank", reference))):
+    for row, site in enumerate(("rho", "gamma0")):
+        draws = arrays[f"post_{site}"]
+        for chain in range(draws.shape[0]):
+            axes[row, col].plot(draws[chain], lw=0.4, color=chain_colours[chain], alpha=0.8)
+        axes[row, col].set_ylabel(site)
+    axes[0, col].set_title(f"{label} chains")
 axes[-1, 0].set_xlabel("draw")
+axes[-1, 1].set_xlabel("draw")
+fig.suptitle("Frozen separated chains against healthy mixing", y=1.02)
 fig.tight_layout()
 save_figure(fig, "nuts_traces", cfg.paths.figures)
 plt.show()
 
 # %% [markdown]
-# ## ADVI against the reference posterior
+# ## Adjudicating the basins by log density
 #
-# The question notebook 03 could not answer: which surrogate family is
-# closer to the truth? Here both guides fitted the collapsed model on the
-# same full year that NUTS certified, so the comparison is clean. Marginals
-# first, then the correlation structure.
+# The basins are not equally good explanations; the joint log density at
+# each cold chain's mean settles their ranking against the warm reference.
+# The degenerate basins sit catastrophically far below the mode the warm
+# start finds, so the cold chains are stuck in regions the posterior
+# barely supports. They are local traps, not competing explanations.
 
 # %%
-compare_sites = ["sigma_level", "sigma_slope", "phi", "gamma0"]
-fig, axes = plt.subplots(1, len(compare_sites), figsize=(13, 3.2))
+from functools import partial
+
+import jax.numpy as jnp
+from numpyro.infer.util import log_density
+
+from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.models import bsts, innovations
+from nemforecastdemand.splits import rolling_origins
+
+splits = load_splits(cfg.paths.processed)
+panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
+max_lag = max(cfg.features.demand_lags)
+fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+inputs = bsts.prepare_inputs(panel, cfg, fit_index)
+test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
+model_args = (
+    jnp.asarray(inputs.y),
+    jnp.asarray(inputs.x_mean),
+    jnp.asarray(inputs.x_var),
+    cfg.bsts,
+)
+AR_SITES = ("rho", "beta", "gamma0", "gamma")
+
+
+def joint_log_density(arrays: dict, chain: int) -> float:
+    params = {
+        name: jnp.asarray(arrays[f"post_{name}"][chain].mean(axis=0)) for name in AR_SITES
+    }
+    value, _ = log_density(innovations.innovations_model, model_args, {}, params)
+    return float(value)
+
+
+rows = {
+    f"cold chain {chain}": {
+        "rho": float(cold["post_rho"][chain].mean()),
+        "gamma0": float(cold["post_gamma0"][chain].mean()),
+        "log density at chain mean": joint_log_density(cold, chain),
+    }
+    for chain in range(cold["post_rho"].shape[0])
+}
+rows["warm reference"] = {
+    "rho": float(reference["post_rho"].mean()),
+    "gamma0": float(reference["post_gamma0"].mean()),
+    "log density at chain mean": joint_log_density(reference, 0),
+}
+pd.DataFrame(rows).T.round(2)
+
+# %% [markdown]
+# ## The reference posterior
+#
+# The reference run seeds chains from the full-rank surrogate with its
+# covariance frozen as the inverse mass matrix and 300 warmup steps. Its
+# diagnostics are what cold NUTS could not deliver. Two independent
+# checks say this is the real posterior and not a guide-induced
+# artefact: warm chains seeded from the *mean-field* guide (different
+# family, diagonal mass matrix) land on the same distribution, and the
+# cold log-density table above puts every alternative basin far below it.
+
+# %%
+summary = pd.DataFrame(reference_meta["site_summary"]).set_index("site")
+health = pd.DataFrame(reference_meta["chain_health"]).set_index("chain")
+print(summary.round(4).to_string())
+health.round(3)
+
+# %%
+warm_mf, _ = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_warm_meanfield_w300")
+agreement = {}
+for site in ("rho", "gamma0"):
+    fr = reference[f"post_{site}"].ravel()
+    mf = warm_mf[f"post_{site}"].ravel()
+    agreement[site] = {
+        "mean (warm from FR)": fr.mean(),
+        "mean (warm from MF)": mf.mean(),
+        "abs mean gap / posterior sd": abs(fr.mean() - mf.mean()) / fr.std(),
+    }
+pd.DataFrame(agreement).T.round(4)
+
+# %% [markdown]
+# ## ADVI against the reference
+#
+# Marginals, then the spread ratios. The classic mean-field failure is
+# under-dispersion on correlated coordinates; full-rank should track the
+# reference closely at fifty dimensions.
+
+# %%
+compare_sites = ["rho", "gamma0"]
+fig, axes = plt.subplots(1, len(compare_sites), figsize=(10, 3.2))
 for ax, site in zip(axes, compare_sites, strict=True):
-    nuts_draws = cold[f"post_{site}"].ravel()
+    nuts_draws = reference[f"post_{site}"].ravel()
     grid_lo = min(nuts_draws.min(), *(fit[0][f"draw_{site}"].min() for fit in vi_fits.values()))
     grid_hi = max(nuts_draws.max(), *(fit[0][f"draw_{site}"].max() for fit in vi_fits.values()))
     grid = np.linspace(grid_lo, grid_hi, 120)
     for label, draws, colour in (
-        ("NUTS", nuts_draws, "black"),
+        ("NUTS reference", nuts_draws, "black"),
         ("mean-field", vi_fits["meanfield"][0][f"draw_{site}"], palette("demand")),
         ("full-rank", vi_fits["fullrank"][0][f"draw_{site}"], palette("accent")),
     ):
@@ -172,175 +222,149 @@ plt.show()
 
 # %%
 rows = {}
-for site in compare_sites:
-    nuts_sd = cold[f"post_{site}"].ravel().std()
+beta_ref = reference["post_beta"].reshape(-1, reference["post_beta"].shape[-1])
+for site in ("rho", "gamma0"):
+    nuts_sd = reference[f"post_{site}"].ravel().std()
     rows[site] = {
         "sd NUTS": nuts_sd,
         "sd MF / NUTS": vi_fits["meanfield"][0][f"draw_{site}"].std() / nuts_sd,
         "sd FR / NUTS": vi_fits["fullrank"][0][f"draw_{site}"].std() / nuts_sd,
     }
+beta_sd_ref = beta_ref.std(axis=0)
+rows["beta (median over 41)"] = {
+    "sd NUTS": float(np.median(beta_sd_ref)),
+    "sd MF / NUTS": float(
+        np.median(vi_fits["meanfield"][0]["draw_beta"].std(axis=0) / beta_sd_ref)
+    ),
+    "sd FR / NUTS": float(
+        np.median(vi_fits["fullrank"][0]["draw_beta"].std(axis=0) / beta_sd_ref)
+    ),
+}
 pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
-# Pairwise correlations among hyperparameters: NUTS defines the target,
-# full-rank can chase it and mean-field is structurally zero.
-
-# %%
-pair_sites = ["sigma_level", "sigma_slope", "phi", "gamma0"]
-
-
-def pair_correlations(draw_map: dict[str, np.ndarray]) -> pd.Series:
-    out = {}
-    for i, a in enumerate(pair_sites):
-        for b in pair_sites[i + 1 :]:
-            out[f"{a} ~ {b}"] = np.corrcoef(draw_map[a].ravel(), draw_map[b].ravel())[0, 1]
-    return pd.Series(out)
-
-
-pd.DataFrame(
-    {
-        "NUTS": pair_correlations({s: cold[f"post_{s}"] for s in pair_sites}),
-        "full-rank ADVI": pair_correlations(
-            {s: vi_fits["fullrank"][0][f"draw_{s}"] for s in pair_sites}
-        ),
-        "mean-field ADVI": pair_correlations(
-            {s: vi_fits["meanfield"][0][f"draw_{s}"] for s in pair_sites}
-        ),
-    }
-).round(3)
-
-# %% [markdown]
-# ## Predictive accuracy, NUTS against ADVI
+# ## Predictions and the epistemic share, three inferences side by side
 #
-# Same Rao-Blackwellised prediction pipeline, same test origins, archived
-# forecast weather. The full cross-model table lives in notebook 05; this
-# is the inference-to-inference comparison at a fixed model.
+# Same prediction pipeline, same test origins, archived forecast weather.
+# The decomposition has two components for this model (the origin residual
+# is observed, so there is no state term); the parameter share is the
+# epistemic fraction, and a surrogate that under-disperses must
+# under-state it.
 
 # %%
-y_test = cold["y_test"]
+from nemforecastdemand.models.predict import variance_decomposition_innovations
+
+y_test = reference["y_test"]
+nuts_flat = {
+    name: reference[f"post_{name}"].reshape(-1, *reference[f"post_{name}"].shape[2:])
+    for name in AR_SITES
+}
+keep = max(nuts_flat["rho"].shape[0] // 1000, 1)
+draw_sets = {
+    "NUTS reference": {name: value[::keep] for name, value in nuts_flat.items()},
+    "mean-field": {name: vi_fits["meanfield"][0][f"draw_{name}"] for name in AR_SITES},
+    "full-rank": {name: vi_fits["fullrank"][0][f"draw_{name}"] for name in AR_SITES},
+}
+
 crps_rows = {}
 for label, paths in (
-    ("collapsed NUTS", cold["forecast_paths"]),
-    ("collapsed ADVI mean-field", vi_fits["meanfield"][0]["forecast_paths"]),
-    ("collapsed ADVI full-rank", vi_fits["fullrank"][0]["forecast_paths"]),
+    ("NUTS reference", reference["forecast_paths"]),
+    ("ADVI mean-field", vi_fits["meanfield"][0]["forecast_paths"]),
+    ("ADVI full-rank", vi_fits["fullrank"][0]["forecast_paths"]),
 ):
     crps_rows[label] = np.mean(
         [crps_samples(y_test[i], paths[:, i, :]).mean() for i in range(y_test.shape[0])]
     )
 pd.Series(crps_rows, name="test CRPS (MW)").to_frame().round(1)
 
-# %% [markdown]
-# ## Aleatoric against epistemic uncertainty
-#
-# Conditional on a hyperparameter draw the model is linear-Gaussian, so
-# the predictive variance splits exactly into four sources: **parameter**
-# (posterior spread of per-draw predictive means) and **state** (precision
-# of the level and slope estimate at the origin) are epistemic, while
-# **process** (future trend innovations) and **observation** (the
-# heteroskedastic noise floor) are aleatoric. With NUTS as the reference,
-# the epistemic share doubles as an inference diagnostic: a surrogate that
-# under-states posterior spread reports too little epistemic uncertainty,
-# and that bias survives into any downstream decision that hinges on
-# whether more data would help.
-
 # %%
-from nemforecastdemand.data.loaders import load_splits
-from nemforecastdemand.models import bsts
-from nemforecastdemand.models.predict import variance_decomposition
-from nemforecastdemand.splits import rolling_origins
-
-splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
-max_lag = max(cfg.features.demand_lags)
-fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
-inputs = bsts.prepare_inputs(panel, cfg, fit_index)
-test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
-
-sites = tuple(s for s in bsts.HYPER_SITES if s not in ("level_init", "slope_init"))
-
-
-def with_marginalised_inits(draws: dict) -> dict:
-    zeros = np.zeros(draws["sigma_level"].shape[0], dtype=np.float32)
-    return {**draws, "level_init": zeros, "slope_init": zeros}
-
-
-nuts_flat = {
-    name: cold[f"post_{name}"].reshape(-1, *cold[f"post_{name}"].shape[2:]) for name in sites
-}
-keep = max(nuts_flat["sigma_level"].shape[0] // 1000, 1)
-draw_sets = {
-    "NUTS": with_marginalised_inits({name: value[::keep] for name, value in nuts_flat.items()}),
-    "mean-field": with_marginalised_inits(
-        {name: vi_fits["meanfield"][0][f"draw_{name}"] for name in sites}
-    ),
-    "full-rank": with_marginalised_inits(
-        {name: vi_fits["fullrank"][0][f"draw_{name}"] for name in sites}
-    ),
-}
 decomp = {
-    label: variance_decomposition(draws, inputs, panel, cfg, test_origins)
+    label: variance_decomposition_innovations(draws, inputs, panel, cfg, test_origins)
     for label, draws in draw_sets.items()
 }
-
-component_order = ["observation", "process", "state", "parameter"]
-component_colours = {
-    "observation": "#cccccc",
-    "process": "#969696",
-    "state": "#8fc1e3",
-    "parameter": "#1f5673",
-}
 hours = (np.arange(cfg.horizon) + 1) / 2
-fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8), sharey=True)
-for ax, (label, parts) in zip(axes, decomp.items(), strict=True):
-    total = sum(parts.values())
-    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
-    ax.stackplot(
+
+fig, ax = plt.subplots(figsize=(7.5, 4))
+styles = {"NUTS reference": "-", "mean-field": "--", "full-rank": ":"}
+colours_d = {
+    "NUTS reference": "black",
+    "mean-field": palette("demand"),
+    "full-rank": palette("accent"),
+}
+for label, parts in decomp.items():
+    total = parts["parameter"] + parts["innovation"]
+    ax.plot(
         hours,
-        shares,
-        labels=component_order,
-        colors=[component_colours[n] for n in component_order],
-        alpha=0.95,
+        (parts["parameter"] / total).mean(axis=0),
+        ls=styles[label],
+        color=colours_d[label],
+        label=label,
     )
-    ax.set_title(label)
-    ax.set_xlabel("lead time (hours)")
-    ax.set_ylim(0, 1)
-    ax.set_xlim(hours[0], hours[-1])
-axes[0].set_ylabel("share of predictive variance")
-axes[2].legend(loc="center right", fontsize=8)
-fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.04)
+ax.set_xlabel("lead time (hours)")
+ax.set_ylabel("epistemic (parameter) share")
+ax.set_title("Epistemic share of predictive variance by lead time")
+ax.legend()
 save_figure(fig, "collapsed_variance_decomposition", cfg.paths.figures)
 plt.show()
 
 # %%
 rows = {}
 for label, parts in decomp.items():
-    total = sum(parts.values())
-    rows[label] = {f"{name} share": float((parts[name] / total).mean()) for name in component_order}
-    rows[label]["epistemic share"] = rows[label]["state share"] + rows[label]["parameter share"]
-    rows[label]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
+    total = parts["parameter"] + parts["innovation"]
+    rows[label] = {
+        "parameter share": float((parts["parameter"] / total).mean()),
+        "innovation share": float((parts["innovation"] / total).mean()),
+        "mean predictive sd (MW)": float(np.sqrt(total.mean())),
+    }
 pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
-# ## Pricing the ADVI warm start
+# ## The homoskedastic ablation
 #
-# The warm runs seed every chain from the fitted surrogate and freeze the
-# inverse mass matrix to the surrogate covariance (diagonal from
-# mean-field, dense from full-rank), keeping only step-size adaptation. The
-# accounting is strict:
+# Identical model with the variance head switched off: one constant
+# innovation scale, the same noise structure ARIMA uses. Warm started the
+# same way (its cold chains fall into the same traps). The comparison
+# isolates what covariate-driven spread buys; notebook 05 carries both
+# rows into the cross-model table with calibration alongside.
+
+# %%
+rows = {
+    "heteroskedastic": {
+        "rho": float(reference["post_rho"].mean()),
+        "max R-hat": reference_meta["max_rhat"],
+        "test CRPS (MW)": float(crps_rows["NUTS reference"]),
+    },
+    "homoskedastic ablation": {
+        "rho": float(homo["post_rho"].mean()),
+        "max R-hat": homo_meta["max_rhat"],
+        "test CRPS (MW)": float(
+            np.mean(
+                [
+                    crps_samples(y_test[i], homo["forecast_paths"][:, i, :]).mean()
+                    for i in range(y_test.shape[0])
+                ]
+            )
+        ),
+    },
+}
+pd.DataFrame(rows).T.round(3)
+
+# %% [markdown]
+# ## Pricing the warm start
 #
-# - **cold total** = full warmup + sampling, everything adapted from scratch;
-# - **warm total** = ADVI fit + reduced warmup + sampling.
-#
-# Comparison happens at matched quality: wall-clock to a target bulk ESS of
-# 400 with R-hat under 1.01 and no divergences. A shorter warmup that mixes
-# worse is not faster, it is unfinished.
+# Strict accounting at matched quality: cold total is full warmup plus
+# sampling; warm total adds the ADVI fit it depends on. Quality means
+# bulk ESS at the target with R-hat under threshold and no divergences;
+# a run that misses quality is unfinished, not fast. For this model the
+# cold rows fail outright, which changes the conclusion from "warm starts
+# are cheaper" to "warm starts are how NUTS gets a posterior here at all".
 
 # %%
 target = cfg.warm_start.target_bulk_ess
 runs = {"cold": cold_meta}
 for kind in ("meanfield", "fullrank"):
     for reduced in cfg.warm_start.reduced_warmup:
-        stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+        stem = f"bsts_innovations_nuts_warm_{kind}_w{reduced}"
         runs[f"warm {kind} w={reduced}"] = load_artifact(cfg.paths.artifacts / stem)[1]
 
 rows = {}
@@ -371,28 +395,26 @@ bars = warm_table[column].astype(float)
 colours_bar = ["#2e7d32" if ok else "#b71c1c" for ok in warm_table["quality met"]]
 ax.barh(bars.index[::-1], bars[::-1], color=colours_bar[::-1])
 ax.set_xlabel(f"wall-clock to bulk ESS {target:.0f}, R-hat < {cfg.warm_start.rhat_threshold} (s)")
-ax.set_title("Cold versus warm-started NUTS at matched quality")
+ax.set_title("Cold versus warm-started NUTS at matched quality (red = quality failed)")
 save_figure(fig, "warm_start_accounting", cfg.paths.figures)
 plt.show()
 
 # %% [markdown]
-# Reading the table honestly: the warm starts must amortise the ADVI fit
-# they depend on, so they only win when the reduced warmup plus sampling
-# saves more than the surrogate cost, and only count at all when quality
-# holds (green bars). Any red bar is a warm start that bought speed with
-# broken mixing or divergences, the failure mode flagged in the brief: a
-# surrogate that under-estimates variance hands the sampler a mis-scaled
-# mass matrix. At fifty dimensions the surrogate covariance is cheap to
-# estimate well, which is exactly the regime where the warm start should
-# shine; notebook 05 carries the timing column into the final comparison.
+# For completeness, the trend model told the opposite story: its collapsed
+# likelihood mixed cleanly from cold (max R-hat 1.004, no divergences) and
+# the warm start was an economy rather than a necessity, cutting
+# wall-clock to the ESS target roughly in half.
 
 # %% [markdown]
-# ## GPU against CPU
+# ## GPU against CPU, both formulations
 #
-# The entire collapsed suite was refitted on 32 CPU cores with the same
-# code, the same settings and the same explicit timing barriers, so every
-# row is a like-for-like wall-clock comparison. ADVI rows report the fit;
-# NUTS rows report warmup plus sampling.
+# Every fit was rerun on the CPU (chains in parallel across cores) with
+# identical code, settings and timing barriers. The collapsed likelihood
+# is a 15,000-step sequential scan inside every gradient: the GPU cannot
+# parallelise it, so the CPU wins the long fits outright. The innovations
+# likelihood is pure matrix arithmetic: the GPU wins everywhere, and both
+# devices finish in seconds. Likelihood design, not hardware, was the
+# binding constraint all along.
 
 
 # %%
@@ -403,31 +425,50 @@ def wall_seconds(meta: dict) -> float:
     return t["warmup_seconds"] + t["sample_seconds"]
 
 
-stems = {
-    "ADVI mean-field": "bsts_collapsed_vi_meanfield",
-    "ADVI full-rank": "bsts_collapsed_vi_fullrank",
-    "NUTS cold": "bsts_collapsed_nuts_cold",
-}
-for kind in ("meanfield", "fullrank"):
-    for reduced in cfg.warm_start.reduced_warmup:
-        stems[f"NUTS warm {kind} w={reduced}"] = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+def bench_table(prefix: str) -> pd.DataFrame:
+    stems = {
+        "ADVI mean-field": f"{prefix}_vi_meanfield",
+        "ADVI full-rank": f"{prefix}_vi_fullrank",
+        "NUTS cold": f"{prefix}_nuts_cold",
+    }
+    for kind in ("meanfield", "fullrank"):
+        for reduced in cfg.warm_start.reduced_warmup:
+            stems[f"NUTS warm {kind} w={reduced}"] = f"{prefix}_nuts_warm_{kind}_w{reduced}"
+    rows = {}
+    for label, stem in stems.items():
+        gpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
+        cpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.cpu.json").read_text())
+        gpu_s, cpu_s = wall_seconds(gpu_meta), wall_seconds(cpu_meta)
+        rows[label] = {"GPU (s)": gpu_s, "CPU (s)": cpu_s, "GPU speed-up": cpu_s / gpu_s}
+    return pd.DataFrame(rows).T
 
-bench_rows = {}
-for label, stem in stems.items():
-    gpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
-    cpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.cpu.json").read_text())
-    gpu_s, cpu_s = wall_seconds(gpu_meta), wall_seconds(cpu_meta)
-    bench_rows[label] = {"GPU (s)": gpu_s, "CPU (s)": cpu_s, "speed-up": cpu_s / gpu_s}
-pd.DataFrame(bench_rows).T.round(2)
+
+bench = pd.concat(
+    {
+        "collapsed (Kalman scan)": bench_table("bsts_collapsed"),
+        "innovations (no scan)": bench_table("bsts_innovations"),
+    }
+)
+bench.round(2)
 
 # %% [markdown]
+# One caveat on the collapsed GPU rows: the asynchronous dispatch barrier
+# sits between warmup and sampling, but on the GPU the vectorised cold
+# run's warmup compute leaks into its sampling figure, so only the totals
+# are comparable for that row. All conclusions above use totals.
+#
 # ## Summary
 #
-# - Written with explicit states the model defeats NUTS (seventeen hours,
-#   incomplete, stopped) and the full-rank guide alike; the marginalised
-#   likelihood is what makes the rest of this notebook possible.
-# - On the collapsed model NUTS passes its full diagnostic battery on a
-#   full year of data and stands as the reference posterior.
-# - The surrogate adjudication, the warm-start accounting at matched
-#   quality and the hardware verdict are in the tables above; their
-#   narratives are written against the executed numbers.
+# - Cold NUTS on the innovations model is defeated by degenerate basins
+#   (all-noise and near-unit-root); the log-density table shows they are
+#   traps, not explanations. VI locates the data-preferred mode, NUTS
+#   certifies it: the warm start is a necessity here, not an optimisation.
+# - The certified reference passes every diagnostic with thousands of
+#   effective samples in seconds of sampling, and two independent guide
+#   families warm-start to the same posterior.
+# - Full-rank ADVI tracks the reference closely; mean-field under-disperses
+#   on the correlated coordinates, visible in the sd ratios and in its
+#   epistemic share.
+# - The hardware verdict inverts with the likelihood: the Kalman scan made
+#   the GPU lose to the CPU, the innovations form makes everything fast
+#   and hands the GPU the win. The constraint was likelihood design.

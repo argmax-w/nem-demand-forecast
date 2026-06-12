@@ -4,7 +4,7 @@ The collapsed BSTS posterior shrank the level innovation to nothing and
 pushed every short-memory fluctuation through a heavily damped slope, which
 filtering loved and forecasting paid for: slope noise integrates into the
 level, so 48-step paths accumulated process variance until the model scored
-worse than the weekly naive. The ARIMA baseline points at the repair — its
+worse than the weekly naive. The ARIMA baseline points at the repair: its
 selected order (1, 0, 1) carries the same short-run autocorrelation in a
 stationary error instead of an integrated trend. This module is that
 structure on the Bayesian side: the same regression and heteroskedastic
@@ -18,9 +18,9 @@ likelihood on the innovations rather than on latent error states removes
 the sequential dependence entirely: residuals come from one matrix product
 and the innovations from a shifted difference, so there is no scan, no
 Kalman pass and nothing the GPU dislikes. Because the error is first-order
-Markov, prediction conditions only on the residual at the forecast origin
-— observed exactly, no filtering uncertainty — and the h-step predictive
-moments are closed-form in powers of rho.
+Markov, prediction conditions only on the residual at the forecast origin,
+which is observed exactly with no filtering uncertainty, and the h-step
+predictive moments are closed-form in powers of rho.
 """
 
 from __future__ import annotations
@@ -183,12 +183,12 @@ def decompose_horizon_variance(
     ``x'beta + rho^(h+1) e_origin`` and variance ``sum_j rho^(2(h-j))
     sigma_j^2``, so the law of total variance gives exactly two terms:
 
-    - ``parameter``: variance across draws of the conditional mean — all
+    - ``parameter``: variance across draws of the conditional mean, all
       the epistemic uncertainty there is, since the origin residual is
       observed rather than filtered (the state term of the trend models is
       structurally zero here);
     - ``innovation``: mean across draws of the accumulated innovation
-      variance — the aleatoric noise, playing the roles that process and
+      variance, the aleatoric noise playing the roles that process and
       observation variance split between them under the trend models.
 
     Returns
