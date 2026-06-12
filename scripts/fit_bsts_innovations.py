@@ -171,6 +171,11 @@ def main() -> None:
             },
         )
 
+    # Cold NUTS is kept as a diagnostic, not a reference: from dispersed
+    # inits the chains land in degenerate basins (an all-noise mode and the
+    # near-unit-root ridge where differencing erases the regression) and
+    # cannot cross between them, so its draws document the failure and its
+    # predictions are deliberately not produced.
     run = fit_nuts(model_fn, cfg.nuts, seed=cfg.seed)
     print(
         f"innovations cold on {run.device}: warmup {run.timings['warmup_seconds']:.0f}s, "
@@ -178,11 +183,7 @@ def main() -> None:
         f"max rhat {run.summary()['max_rhat'].max():.4f}",
         flush=True,
     )
-    draws = flatten_chains(run.posterior)
-    keep = max(draws["rho"].shape[0] // cfg.vi.posterior_draws, 1)
-    thinned = {name: draws[name][::keep] for name in sites}
-    timings = dict(run.timings)
-    arrays = predict_and_pack(thinned, timings, cfg.bsts)
+    arrays = {}
     if not sidecar_only:
         for name in sites:
             arrays[f"post_{name}"] = run.posterior[name]
@@ -191,9 +192,10 @@ def main() -> None:
     save(
         "bsts_innovations_nuts_cold",
         arrays,
-        run_meta(run, fit_index, {"predict_seconds": timings.get("predict_seconds")}),
+        run_meta(run, fit_index, {"note": "diagnostic only; multimodal cold chains"}),
     )
 
+    reference_warmup = max(cfg.warm_start.reduced_warmup)
     for kind in ("meanfield", "fullrank"):
         warm = warm_start_from_vi(vi_fits[kind], cfg.nuts.chains, seed=cfg.seed + 20)
         for reduced in cfg.warm_start.reduced_warmup:
@@ -210,10 +212,20 @@ def main() -> None:
                 },
             )
             arrays = {}
+            timings = dict(run.timings)
             if not sidecar_only:
                 arrays = {f"post_{name}": run.posterior[name] for name in sites}
                 for name, value in run.extra.items():
                     arrays[f"extra_{name}"] = np.asarray(value)
+            # The longest-warmup full-rank run is the reference posterior
+            # (cold NUTS being multimodal), so it carries the predictions.
+            if kind == "fullrank" and reduced == reference_warmup:
+                draws = flatten_chains(run.posterior)
+                keep = max(draws["rho"].shape[0] // cfg.vi.posterior_draws, 1)
+                thinned = {name: draws[name][::keep] for name in sites}
+                arrays.update(predict_and_pack(thinned, timings, cfg.bsts))
+                meta["predict_seconds"] = timings.get("predict_seconds")
+                meta["role"] = "reference posterior"
             save(f"bsts_innovations_nuts_warm_{kind}_w{reduced}", arrays, meta)
             print(
                 f"innovations warm {kind} w{reduced}: "
@@ -225,13 +237,18 @@ def main() -> None:
 
     # Ablation: the same model with an ARIMA-style constant innovation
     # scale, so the comparison can attribute the heteroskedastic head's
-    # contribution separately from everything else.
+    # contribution separately from everything else. Warm started from its
+    # own mean-field fit, since cold chains suffer the same multimodality.
     homo_bsts = replace(cfg.bsts, heteroskedastic=False)
     homo_model = model_for(homo_bsts)
     homo_sites = sites_for(homo_bsts)
-    run = fit_nuts(homo_model, cfg.nuts, seed=cfg.seed + 1)
+    homo_vi = fit_advi(homo_model, "meanfield", cfg.vi, seed=cfg.seed + 2)
+    warm = warm_start_from_vi(homo_vi, cfg.nuts.chains, seed=cfg.seed + 21)
+    run = fit_nuts(
+        homo_model, cfg.nuts, seed=cfg.seed + 1, warmup=reference_warmup, warm_start=warm
+    )
     print(
-        f"innovations homoskedastic cold on {run.device}: "
+        f"innovations homoskedastic warm on {run.device}: "
         f"warmup {run.timings['warmup_seconds']:.0f}s, "
         f"sampling {run.timings['sample_seconds']:.0f}s, "
         f"max rhat {run.summary()['max_rhat'].max():.4f}",
@@ -248,7 +265,15 @@ def main() -> None:
     save(
         "bsts_innovations_nuts_homoskedastic",
         arrays,
-        run_meta(run, fit_index, {"ablation": "constant innovation scale"}),
+        run_meta(
+            run,
+            fit_index,
+            {
+                "ablation": "constant innovation scale",
+                "advi_seconds": homo_vi.timings["fit_seconds"],
+                "advi_kind": "meanfield",
+            },
+        ),
     )
 
 
