@@ -1,17 +1,22 @@
-"""Fit BART on the full pre-test history and write predictive draws.
+"""Fit heteroskedastic BART on origin blocks and write predictive draws.
 
-Bayesian additive regression trees over the shared design matrix, the
-Bayesian counterpart to the LightGBM benchmark: a sum-of-trees prior with
-posterior uncertainty over the regression function. Tree structures are
-discrete, so neither ADVI nor NUTS applies; the model is fitted by its
-native particle-Gibbs sampler (``pymc-bart``) with the Gaussian noise
-scale sampled alongside. Like the gradient-boosted benchmark this is a
-direct regression: with a 48-step horizon every demand lag at every
-horizon step is realised before the origin, so no recursion is needed.
+Bayesian additive regression trees, the Bayesian counterpart to the
+LightGBM benchmark: where LightGBM's quantile heads each learn their own
+function of the features, BART here learns two — a sum-of-trees mean and a
+sum-of-trees log scale over the same design — so the predictive spread
+adapts to the covariates exactly as freely as the quantile heads do. Tree
+structures are discrete, so neither ADVI nor NUTS applies; the model is
+fitted by its native particle-Gibbs sampler (``pymc-bart``).
 
-Posterior predictive draws share one function draw across a horizon, so
-the 48-step paths carry coherent function uncertainty plus independent
-observation noise, and the energy score is well defined.
+Training rows are origin blocks (the shared design plus the origin-anchored
+recency features), mirroring the operational setting, and the tree count is
+selected on the validation split before the final fit on the full pre-test
+history — the same protocol that selects the ARIMA order. The target is
+standardised so the log-scale head's exp link starts at a sane magnitude.
+
+Posterior predictive draws share one function draw across a horizon, so the
+48-step paths carry coherent function uncertainty plus covariate-dependent
+noise, and the energy score is well defined.
 """
 
 from __future__ import annotations
@@ -25,13 +30,21 @@ import pandas as pd
 
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.evaluation.metrics import crps_samples
 from nemforecastdemand.features.weather import degree_days
-from nemforecastdemand.models.base import build_design, perturbation_overrides
+from nemforecastdemand.models.base import (
+    build_design,
+    perturbation_overrides,
+    recency_features,
+    stacked_origin_design,
+)
 from nemforecastdemand.models.predict import fit_perturbation_models
 from nemforecastdemand.splits import horizon_index, rolling_origins
 from nemforecastdemand.utils import save_artifact
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+TREE_CANDIDATES = (50, 100, 200)
 
 
 def main() -> None:
@@ -53,66 +66,42 @@ def main() -> None:
     splits = load_splits(cfg.paths.processed)
     panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
-    fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+    # The week-ago recency deviation reads one step behind the longest lag,
+    # hence max_lag + 1 when qualifying training origins.
+    train_origins = rolling_origins(
+        splits["train"].index, panel.index, cfg.origins, cfg.horizon, max_lag + 1
+    )
+    validation_origins = rolling_origins(
+        splits["validation"].index, panel.index, cfg.origins, cfg.horizon, max_lag + 1
+    )
     test_origins = rolling_origins(
         splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag
     )
-    horizons = [horizon_index(origin, cfg.horizon) for origin in test_origins]
     perturbations = fit_perturbation_models(panel, splits["train"].index)
 
-    design_actual = build_design(panel, cfg, weather_source="actual")
-    design_forecast = build_design(panel, cfg, weather_source="forecast")
-    x_train = design_actual.loc[fit_index].to_numpy(dtype=np.float32)
-    y_train = panel["demand_mw"].loc[fit_index].to_numpy(dtype=np.float64)
-    y_test = np.stack(
-        [panel["demand_mw"].loc[index].to_numpy(dtype=np.float32) for index in horizons]
-    )
-    print(f"fit rows {len(fit_index)}, features {x_train.shape[1]}, origins {len(test_origins)}")
+    def fit_two_head(x: np.ndarray, y_std: np.ndarray, m: int, tune_n: int, draws_n: int):
+        """Fit the mean and log-scale heads; return (model, idata)."""
+        with pm.Model() as model:
+            data_x = pm.Data("X", x)
+            w = pmb.BART("w", data_x, y_std, m=m, shape=(2, len(y_std)), separate_trees=True)
+            pm.Normal("y", w[0], pm.math.exp(w[1]), observed=y_std, shape=w[0].shape)
+            idata = pm.sample(
+                tune=tune_n,
+                draws=draws_n,
+                chains=bart.chains,
+                cores=bart.chains,
+                random_seed=cfg.seed,
+                progressbar=True,
+            )
+        return model, idata
 
-    timings: dict[str, float] = {}
-    with pm.Model() as model:
-        data_x = pm.Data("X", x_train)
-        mu = pmb.BART("mu", data_x, y_train, m=bart.trees)
-        sigma = pm.HalfNormal("sigma", float(y_train.std()))
-        pm.Normal("y", mu, sigma, observed=y_train, shape=mu.shape)
-        start = time.perf_counter()
-        idata = pm.sample(
-            tune=tune,
-            draws=draws,
-            chains=bart.chains,
-            cores=bart.chains,
-            random_seed=cfg.seed,
-            progressbar=True,
-        )
-        timings["fit_seconds"] = time.perf_counter() - start
-
-    # Convergence on the continuous parameter; the function itself is
-    # summarised by the worst R-hat across a thinned set of training rows.
-    import arviz as az
-
-    sigma_summary = {
-        "sigma_rhat": float(az.rhat(idata.posterior["sigma"]).values),
-        "sigma_bulk_ess": float(az.ess(idata.posterior["sigma"]).values),
-    }
-    mu_sub = idata.posterior["mu"].isel(mu_dim_0=slice(0, None, 200))
-    sigma_summary["mu_max_rhat_sampled"] = float(az.rhat(mu_sub).max().values)
-    print(
-        f"fit {timings['fit_seconds']:.0f}s, sigma R-hat {sigma_summary['sigma_rhat']:.4f}, "
-        f"mu max R-hat (sampled rows) {sigma_summary['mu_max_rhat_sampled']:.4f}"
-    )
-
-    # Thinning is per chain: a step of (chains * draws / keep) leaves
-    # keep / chains draws in each chain, keep in total.
-    step = max(bart.chains * draws // args.keep_draws, 1)
-    thinned = idata.sel(draw=slice(None, None, step))
-
-    def predict_rows(design_block: np.ndarray, seed_offset: int) -> np.ndarray:
+    def predict_rows(model, thinned, design_block: np.ndarray, seed_offset: int) -> np.ndarray:
         """Posterior predictive draws on new rows, trees re-evaluated."""
         with model:
             pm.set_data({"X": design_block.astype(np.float32)})
             post = pm.sample_posterior_predictive(
                 thinned,
-                sample_vars=["mu", "y"],
+                sample_vars=["w", "y"],
                 predictions=True,
                 progressbar=False,
                 random_seed=cfg.seed + seed_offset,
@@ -120,24 +109,114 @@ def main() -> None:
         values = post.predictions["y"].values
         return values.reshape(-1, values.shape[-1]).astype(np.float32)
 
-    def stacked_design(blocks: list[pd.DataFrame]) -> np.ndarray:
-        return np.concatenate([block.to_numpy(dtype=np.float32) for block in blocks])
+    # Tree-count selection on the validation split, mirroring the ARIMA
+    # order-selection protocol: fit on train, score CRPS on validation.
+    x_train, y_train = stacked_origin_design(panel, cfg, train_origins)
+    x_val, y_val = stacked_origin_design(panel, cfg, validation_origins)
+    y_loc, y_scale = float(y_train.mean()), float(y_train.std())
+    print(
+        f"selection: {len(train_origins)} train origins ({len(x_train)} rows), "
+        f"{len(validation_origins)} validation origins",
+        flush=True,
+    )
+    selection: dict[int, float] = {}
+    for m in TREE_CANDIDATES:
+        start = time.perf_counter()
+        model, idata = fit_two_head(
+            x_train.to_numpy(dtype=np.float32),
+            ((y_train - y_loc) / y_scale).to_numpy(),
+            m,
+            tune_n=min(tune, 500),
+            draws_n=min(draws, 500),
+        )
+        step = max(bart.chains * min(draws, 500) // 250, 1)
+        thinned = idata.sel(draw=slice(None, None, step))
+        paths = predict_rows(model, thinned, x_val.to_numpy(dtype=np.float32), 99)
+        crps = float(
+            crps_samples(((y_val - y_loc) / y_scale).to_numpy(), paths.astype(np.float64)).mean()
+            * y_scale
+        )
+        selection[m] = crps
+        print(
+            f"  m={m}: validation CRPS {crps:.1f} MW ({time.perf_counter() - start:.0f}s)",
+            flush=True,
+        )
+    best_m = min(selection, key=selection.get)
+    print(f"selected m={best_m}", flush=True)
+
+    # Final fit on the full pre-test history (train plus validation), with
+    # scalers from the same window.
+    fit_origins = train_origins.union(validation_origins)
+    x_fit, y_fit = stacked_origin_design(panel, cfg, fit_origins)
+    y_loc, y_scale = float(y_fit.mean()), float(y_fit.std())
+    y_fit_std = ((y_fit - y_loc) / y_scale).to_numpy()
+    print(f"final fit: {len(fit_origins)} origins, {len(x_fit)} rows", flush=True)
+
+    timings: dict[str, float] = {}
+    start = time.perf_counter()
+    model, idata = fit_two_head(
+        x_fit.to_numpy(dtype=np.float32), y_fit_std, best_m, tune_n=tune, draws_n=draws
+    )
+    timings["fit_seconds"] = time.perf_counter() - start
+
+    # Convergence on the sampled function values: worst R-hat across a
+    # thinned set of training rows, for both heads.
+    import arviz as az
+
+    w_sub = idata.posterior["w"].isel(w_dim_1=slice(0, None, 500))
+    diagnostics = {
+        "w_max_rhat_sampled": float(az.rhat(w_sub).max().values),
+        "w_min_bulk_ess_sampled": float(az.ess(w_sub).min().values),
+    }
+    print(
+        f"fit {timings['fit_seconds']:.0f}s, "
+        f"w max R-hat (sampled rows) {diagnostics['w_max_rhat_sampled']:.4f}",
+        flush=True,
+    )
+
+    # Thinning is per chain: a step of (chains * draws / keep) leaves
+    # keep / chains draws in each chain, keep in total.
+    step = max(bart.chains * draws // args.keep_draws, 1)
+    thinned = idata.sel(draw=slice(None, None, step))
+
+    horizons = [horizon_index(origin, cfg.horizon) for origin in test_origins]
+    y_test = np.stack(
+        [panel["demand_mw"].loc[index].to_numpy(dtype=np.float32) for index in horizons]
+    )
+    design_actual = build_design(panel, cfg, weather_source="actual")
+    design_forecast = build_design(panel, cfg, weather_source="forecast")
+    recency_blocks = {
+        origin: recency_features(panel, origin, cfg.horizon) for origin in test_origins
+    }
+
+    def stacked_blocks(design: pd.DataFrame, override_blocks: dict | None = None) -> np.ndarray:
+        blocks = []
+        for origin, index in zip(test_origins, horizons, strict=True):
+            block = design.loc[index]
+            if override_blocks is not None:
+                block = override_blocks[origin]
+            block = pd.concat([block, recency_blocks[origin]], axis=1)
+            blocks.append(block.to_numpy(dtype=np.float32))
+        return np.concatenate(blocks)
+
+    def in_megawatts(paths: np.ndarray) -> np.ndarray:
+        return (paths * y_scale + y_loc).astype(np.float32)
 
     variants: dict[str, np.ndarray] = {}
     n_origins, horizon = len(test_origins), cfg.horizon
 
-    with_timing = time.perf_counter()
-    variants["forecast"] = predict_rows(
-        stacked_design([design_forecast.loc[index] for index in horizons]), 1
+    predict_start = time.perf_counter()
+    variants["forecast"] = in_megawatts(
+        predict_rows(model, thinned, stacked_blocks(design_forecast), 1)
     )
-    variants["actual"] = predict_rows(
-        stacked_design([design_actual.loc[index] for index in horizons]), 2
+    variants["actual"] = in_megawatts(
+        predict_rows(model, thinned, stacked_blocks(design_actual), 2)
     )
     for j, multiplier in enumerate(cfg.perturbation.sweep_multipliers):
         if multiplier == 0:
             continue
-        blocks = []
-        for index in horizons:
+        override_blocks = {}
+        for origin, index in zip(test_origins, horizons, strict=True):
             overrides = perturbation_overrides(panel, index, perturbations, multiplier, cfg.seed)
             block = design_actual.loc[index].copy()
             block.loc[:, overrides.columns] = overrides
@@ -145,32 +224,36 @@ def main() -> None:
                 block["temp_c"], cfg.weather.heating_base, cfg.weather.cooling_base
             )
             block.loc[:, ["cooling_deg", "heating_deg"]] = degrees
-            blocks.append(block)
-        variants[f"perturb_{multiplier:g}"] = predict_rows(stacked_design(blocks), 3 + j)
-    timings["predict_seconds"] = time.perf_counter() - with_timing
+            override_blocks[origin] = block
+        variants[f"perturb_{multiplier:g}"] = in_megawatts(
+            predict_rows(model, thinned, stacked_blocks(design_actual, override_blocks), 3 + j)
+        )
+    timings["predict_seconds"] = time.perf_counter() - predict_start
 
     arrays = {"origins_test": test_origins.asi8, "y_test": y_test}
     for name, paths in variants.items():
         arrays[f"{name}_paths"] = paths.reshape(-1, n_origins, horizon)
-        print(f"variant {name}: paths {arrays[f'{name}_paths'].shape}")
+        print(f"variant {name}: paths {arrays[f'{name}_paths'].shape}", flush=True)
 
     meta = {
-        "sampler": "PGBART (particle Gibbs) for trees, NUTS for sigma",
+        "sampler": "PGBART (particle Gibbs), two sum-of-trees heads (mean, log scale)",
         "settings": {
-            "trees": bart.trees,
+            "trees": best_m,
+            "tree_selection_crps_mw": {str(m): v for m, v in selection.items()},
             "tune": tune,
             "draws": draws,
             "chains": bart.chains,
             "kept_draws": int(arrays["forecast_paths"].shape[0]),
         },
         "timings_seconds": timings,
-        "diagnostics": sigma_summary,
-        "fit_window": [str(fit_index[0]), str(fit_index[-1])],
-        "fit_rows": len(fit_index),
-        "n_features": int(x_train.shape[1]),
+        "diagnostics": diagnostics,
+        "fit_origins": len(fit_origins),
+        "fit_rows": len(x_fit),
+        "n_features": int(x_fit.shape[1]),
+        "target_standardisation": {"loc": y_loc, "scale": y_scale},
     }
     save_artifact(cfg.paths.artifacts / "bart", arrays, meta)
-    print(f"bart: artifacts written, fit {timings['fit_seconds']:.0f}s")
+    print(f"bart: artifacts written, fit {timings['fit_seconds']:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
