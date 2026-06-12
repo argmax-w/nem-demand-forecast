@@ -13,7 +13,7 @@ import pytest
 from tests.conftest import MARKET_TZ, make_panel
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.models.base import (
     build_design,
     recency_features,
@@ -33,45 +33,72 @@ def cfg():
 
 @pytest.fixture(scope="module")
 def committed(cfg):
-    if not (cfg.paths.processed / "train.parquet").exists():
+    if not (cfg.paths.processed / "panel.parquet").exists():
         pytest.skip("committed splits not present")
     return load_splits(cfg.paths.processed)
 
 
-def test_committed_splits_form_one_unbroken_chronology(committed):
-    train, validation, test = (committed[name].index for name in ("train", "validation", "test"))
-    assert train[-1] < validation[0] <= validation[-1] < test[0]
-    union = train.union(validation).union(test)
-    assert union.equals(pd.date_range(union[0], union[-1], freq="30min"))
-    for index in (validation, test):
-        market = index[0].tz_convert(MARKET_TZ)
-        assert (market.hour, market.minute) == (0, 0)
-    assert abs(len(train) / len(union) - 0.70) < 0.01
-    assert abs(len(validation) / len(union) - 0.15) < 0.01
+def test_training_block_precedes_every_evaluation_point(committed):
+    # The core no-leakage guarantee: no training timestamp is at or after
+    # any validation or test timestamp, so no fitting target can sit behind
+    # an evaluation point and no lag feature of a training row can read one.
+    train = committed["train"].index
+    for name in ("validation", "test"):
+        assert train[-1] < committed[name].index[0]
+    assert len(committed["validation"].index.intersection(committed["test"].index)) == 0
 
 
-def test_committed_splits_are_representative(committed):
-    # Every split is at least seven weeks, so each sees the daily and
-    # weekly cycles many times over, and each contains public holidays.
-    for frame in committed.values():
-        assert len(frame) >= 49 * 48
-        assert frame["is_holiday"].any()
+def test_validation_and_test_are_both_all_season(committed):
+    # Both evaluation sets must span every month of the evaluation year, so
+    # selection on validation faces the same seasonal mix as the test set.
+    months = {}
+    for name in ("validation", "test"):
+        market = committed[name].index.tz_convert(MARKET_TZ)
+        months[name] = set(pd.PeriodIndex(market, freq="M"))
+    assert months["validation"] == months["test"]
+    assert len(months["test"]) == 12
+    # The holiday effect is learned on the two-year training block, which
+    # sees every public holiday; whether a five-day evaluation window lands
+    # on one is incidental and not required.
+    assert committed["train"]["is_holiday"].any()
 
-    # The seasonal design runs on the Sydney clock, so daylight saving
-    # must be exercised on both sides of the fit: train straddles the
-    # October transition and test the April one.
-    for name in ("train", "test"):
-        index = committed[name].index[::48]
-        offsets = {ts.tz_convert(LOCAL_TZ).utcoffset() for ts in index}
-        assert len(offsets) == 2
 
-    # Training demand brackets what evaluation asks of the models, so the
-    # test set probes interpolation, not extrapolation in the target.
+def test_validation_and_test_have_no_position_in_month_bias(committed):
+    # Each set takes the early window in half its months and the late
+    # window in the other half, so neither is biased to the start or end of
+    # the month.
+    for name in ("validation", "test"):
+        market = committed[name].index.tz_convert(MARKET_TZ)
+        month = pd.PeriodIndex(market, freq="M").astype(str)
+        frame = pd.DataFrame({"ym": month, "day": market.day})
+        first_day = frame.groupby("ym")["day"].min()
+        early = int((first_day <= 12).sum())
+        late = int((first_day >= 19).sum())
+        assert early == late == 6
+
+
+def test_training_demand_brackets_evaluation(committed):
+    # Two years of training bracket what evaluation asks, so the test set
+    # probes interpolation rather than extrapolation in the target.
     train_demand = committed["train"]["demand_mw"]
     for name in ("validation", "test"):
         demand = committed[name]["demand_mw"]
         inside = demand.between(train_demand.min(), train_demand.max()).mean()
         assert inside > 0.99
+
+
+def test_perturbation_calibration_uses_only_genuine_forecast_rows(cfg, committed):
+    # The early training period predates the forecast archive and carries
+    # actuals in the forecast columns; the perturbation calibration must not
+    # treat those as zero-error forecasts.
+    from nemforecastdemand.models.predict import fit_perturbation_models
+
+    panel = load_panel(cfg.paths.processed)
+    models = fit_perturbation_models(panel, committed["train"].index)
+    # A genuine day-ahead forecast has non-trivial error, so the fitted
+    # per-step scales must be well above zero.
+    for model in models.values():
+        assert float(np.mean(model.sigma_by_step)) > 0.1
 
 
 def test_design_rows_are_invariant_to_future_data(cfg):
