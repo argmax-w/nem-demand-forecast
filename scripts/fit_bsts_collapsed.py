@@ -12,6 +12,7 @@ trade is visible in the timings: cheap dimensions, expensive gradients.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 
@@ -26,7 +27,8 @@ def main() -> None:
     from nemforecastdemand.config import load_config
 
     cfg = load_config(args.config)
-    if args.device == "cpu":
+    sidecar_only = args.device == "cpu"
+    if sidecar_only:
         # The collapsed likelihood is a sequential scan, so vectorised
         # chains run in lockstep on one or two cores. One XLA host device
         # per chain lets the chains run in parallel across the package's
@@ -85,7 +87,18 @@ def main() -> None:
         full["slope_init"] = jnp.zeros(n)
         return full
 
+    def save(stem: str, arrays: dict, meta: dict) -> None:
+        # The CPU pass is a timing benchmark: metadata sidecars only, so
+        # the GPU artifacts and their predictions stay in place.
+        if sidecar_only:
+            path = cfg.paths.artifacts / f"{stem}.cpu.json"
+            path.write_text(json.dumps(meta, indent=2, default=str))
+        else:
+            save_artifact(cfg.paths.artifacts / stem, arrays, meta)
+
     def predict_and_pack(draws: dict[str, np.ndarray], timings: dict[str, float]) -> dict:
+        if sidecar_only:
+            return {}
         with timed("predict_seconds", timings):
             variants, y_true = predict_variants(
                 prediction_draws(draws), inputs, panel, cfg, test_origins, perturbations
@@ -124,18 +137,19 @@ def main() -> None:
         draws = fit.posterior_draws(model_fn, seed=cfg.seed + 10, n_draws=cfg.vi.posterior_draws)
         timings = dict(fit.timings)
         arrays = predict_and_pack(draws, timings)
-        arrays.update(
-            {
-                "elbo_steps": fit.trace.steps,
-                "elbo": fit.trace.elbo,
-                "energy": fit.trace.energy,
-                "entropy": fit.trace.entropy,
-            }
-        )
-        for name in sites:
-            arrays[f"draw_{name}"] = draws[name]
-        save_artifact(
-            cfg.paths.artifacts / f"bsts_collapsed_vi_{kind}",
+        if not sidecar_only:
+            arrays.update(
+                {
+                    "elbo_steps": fit.trace.steps,
+                    "elbo": fit.trace.elbo,
+                    "energy": fit.trace.energy,
+                    "entropy": fit.trace.entropy,
+                }
+            )
+            for name in sites:
+                arrays[f"draw_{name}"] = draws[name]
+        save(
+            f"bsts_collapsed_vi_{kind}",
             arrays,
             {
                 "guide": kind,
@@ -158,14 +172,15 @@ def main() -> None:
     thinned = {name: draws[name][::keep] for name in sites}
     timings = dict(run.timings)
     arrays = predict_and_pack(thinned, timings)
-    for name in sites:
-        arrays[f"post_{name}"] = run.posterior[name]
-    for name, value in run.extra.items():
-        arrays[f"extra_{name}"] = np.asarray(value)
-    save_artifact(
-        cfg.paths.artifacts / "bsts_collapsed_nuts_cold",
+    if not sidecar_only:
+        for name in sites:
+            arrays[f"post_{name}"] = run.posterior[name]
+        for name, value in run.extra.items():
+            arrays[f"extra_{name}"] = np.asarray(value)
+    save(
+        "bsts_collapsed_nuts_cold",
         arrays,
-        run_meta(run, {"predict_seconds": timings["predict_seconds"]}),
+        run_meta(run, {"predict_seconds": timings.get("predict_seconds")}),
     )
 
     for kind in ("meanfield", "fullrank"):
@@ -182,11 +197,12 @@ def main() -> None:
                     "reduced_warmup": reduced,
                 },
             )
-            arrays = {f"post_{name}": run.posterior[name] for name in sites}
-            for name, value in run.extra.items():
-                arrays[f"extra_{name}"] = np.asarray(value)
-            stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
-            save_artifact(cfg.paths.artifacts / stem, arrays, meta)
+            arrays = {}
+            if not sidecar_only:
+                arrays = {f"post_{name}": run.posterior[name] for name in sites}
+                for name, value in run.extra.items():
+                    arrays[f"extra_{name}"] = np.asarray(value)
+            save(f"bsts_collapsed_nuts_warm_{kind}_w{reduced}", arrays, meta)
             print(
                 f"collapsed warm {kind} w{reduced}: "
                 f"warmup {run.timings['warmup_seconds']:.0f}s, "
