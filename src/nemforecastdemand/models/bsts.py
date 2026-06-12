@@ -398,6 +398,90 @@ def kalman_filter_states(
     return np.concatenate(mean_blocks), np.concatenate(cov_blocks)
 
 
+def decompose_horizon_variance(
+    draws: dict[str, jnp.ndarray],
+    filtered_mean: np.ndarray,
+    filtered_cov: np.ndarray,
+    origin_positions: np.ndarray,
+    x_future: np.ndarray,
+    xv_future: np.ndarray,
+    bsts: BstsConfig,
+    chunk: int = 200,
+) -> dict[str, np.ndarray]:
+    """Split the predictive variance at each horizon step into named sources.
+
+    Conditional on one hyperparameter draw the predictive at every step is
+    Gaussian with a closed-form mean and variance, so the law of total
+    variance separates the posterior predictive mixture exactly:
+
+    - ``parameter``: variance across draws of the per-draw predictive mean
+      (posterior uncertainty about hyperparameters and the state estimate
+      they imply);
+    - ``state``: mean across draws of the filtered state covariance
+      propagated through the transition (how well the level and slope at
+      the origin are pinned down);
+    - ``process``: mean across draws of the accumulated future innovation
+      variance (the trend genuinely wanders over the horizon);
+    - ``observation``: mean across draws of the heteroskedastic
+      observation variance.
+
+    The first two are epistemic (more data shrinks them); the last two are
+    aleatoric (irreducible under the model). The four sum to the variance
+    of the simulated predictive paths up to Monte Carlo error.
+
+    Parameters mirror :func:`simulate_horizon_paths`; no randomness is
+    involved, every component is an exact moment given the draws.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        The four components, each ``(O, H)``, standardised variance units.
+    """
+    start_mean = jnp.asarray(filtered_mean[:, origin_positions - 1, :])
+    start_cov = jnp.asarray(filtered_cov[:, origin_positions - 1, :, :])
+    x_future = jnp.asarray(x_future)
+    xv_future = jnp.asarray(xv_future)
+
+    def one_pair(draw, mean, cov, x_fut, xv_fut):
+        phi = draw["phi"] if bsts.damped_slope else 1.0
+        transition = jnp.array([[1.0, 1.0], [0.0, phi]])
+        process_cov = jnp.diag(jnp.array([draw["sigma_level"] ** 2, draw["sigma_slope"] ** 2]))
+        sigma_obs = _observation_scale(draw, xv_fut, bsts.heteroskedastic)
+        regression = x_fut @ draw["beta"]
+
+        def step(carry, reg):
+            m, p_state, p_proc = carry
+            m = transition @ m
+            p_state = transition @ p_state @ transition.T
+            p_proc = transition @ p_proc @ transition.T + process_cov
+            return (m, p_state, p_proc), (m[0] + reg, p_state[0, 0], p_proc[0, 0])
+
+        _, (mu, v_state, v_proc) = jax.lax.scan(step, (mean, cov, jnp.zeros((2, 2))), regression)
+        return mu, v_state, v_proc, sigma_obs**2
+
+    over_origins = jax.vmap(one_pair, in_axes=(None, 0, 0, 0, 0))
+    over_draws = jax.jit(jax.vmap(over_origins, in_axes=(0, 0, 0, None, None)))
+
+    n_draws = start_mean.shape[0]
+    parts: dict[str, list[np.ndarray]] = {"mu": [], "state": [], "process": [], "observation": []}
+    for i in range(0, n_draws, chunk):
+        block = {site: jnp.asarray(value[i : i + chunk]) for site, value in draws.items()}
+        size = block["sigma_level"].shape[0]
+        mu, v_state, v_proc, v_obs = over_draws(
+            block, start_mean[i : i + size], start_cov[i : i + size], x_future, xv_future
+        )
+        for name, value in zip(
+            ("mu", "state", "process", "observation"), (mu, v_state, v_proc, v_obs), strict=True
+        ):
+            parts[name].append(np.asarray(value, dtype=np.float64))
+    return {
+        "parameter": np.concatenate(parts["mu"]).var(axis=0),
+        "state": np.concatenate(parts["state"]).mean(axis=0),
+        "process": np.concatenate(parts["process"]).mean(axis=0),
+        "observation": np.concatenate(parts["observation"]).mean(axis=0),
+    }
+
+
 def simulate_horizon_paths(
     draws: dict[str, jnp.ndarray],
     filtered_mean: np.ndarray,

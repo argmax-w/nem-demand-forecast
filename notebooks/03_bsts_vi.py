@@ -51,6 +51,10 @@
 # the posterior correlations mean-field must discard).
 
 # %%
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # notebook JAX work is light; leave the GPU to fits
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -228,7 +232,7 @@ for kind, (arrays, _meta) in fits.items():
         ]
     )
     crps_rows[f"BSTS ADVI {kind}"] = per_origin.mean()
-crps_rows["ARIMA baseline"] = float(
+crps_rows["ARIMA baseline (same 56-day window)"] = float(
     crps_gaussian(
         arima_arrays["y_test"], arima_arrays["forecast_mean"], arima_arrays["forecast_sd"]
     ).mean()
@@ -262,6 +266,71 @@ for ax, pos, title in ((axes[0], typical, "median origin"), (axes[1], worst, "wo
 axes[0].legend()
 save_figure(fig, "bsts_vi_fan_charts", cfg.paths.figures)
 plt.show()
+
+# %% [markdown]
+# ## Aleatoric against epistemic uncertainty
+#
+# Because the model is linear-Gaussian given a hyperparameter draw, the
+# predictive variance splits exactly (law of total variance) into four
+# named sources: **parameter** (posterior spread of the per-draw
+# predictive means) and **state** (how well the level and slope at the
+# origin are pinned down) are epistemic, shrinking with more data;
+# **process** (future trend innovations) and **observation** (the
+# heteroskedastic noise floor) are aleatoric, irreducible under the model.
+# The split is computed analytically per draw, no simulation involved.
+#
+# The fractions are diagnostic for the inference comparison too: a
+# surrogate that under-states posterior spread must report a smaller
+# epistemic share, so the gap between the two guides previews what the
+# NUTS adjudication in notebook 04 makes precise.
+
+# %%
+from nemforecastdemand.models.predict import variance_decomposition
+
+decomp = {}
+for kind, (arrays, _meta) in fits.items():
+    draws = {site: arrays[f"draw_{site}"] for site in bsts.HYPER_SITES}
+    decomp[kind] = variance_decomposition(draws, inputs, panel, cfg, test_origins)
+
+component_order = ["observation", "process", "state", "parameter"]
+component_colours = {
+    "observation": "#cccccc",
+    "process": "#969696",
+    "state": "#8fc1e3",
+    "parameter": "#1f5673",
+}
+hours = (np.arange(cfg.horizon) + 1) / 2
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+for ax, kind in zip(axes, fits, strict=True):
+    parts = decomp[kind]
+    total = sum(parts.values())
+    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
+    ax.stackplot(
+        hours,
+        shares,
+        labels=component_order,
+        colors=[component_colours[n] for n in component_order],
+        alpha=0.95,
+    )
+    ax.set_title(kind)
+    ax.set_xlabel("lead time (hours)")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(hours[0], hours[-1])
+axes[0].set_ylabel("share of predictive variance")
+axes[1].legend(loc="center right", fontsize=8)
+fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.03)
+save_figure(fig, "bsts_vi_variance_decomposition", cfg.paths.figures)
+plt.show()
+
+# %%
+rows = {}
+for kind in fits:
+    parts = decomp[kind]
+    total = sum(parts.values())
+    rows[kind] = {f"{name} share": float((parts[name] / total).mean()) for name in component_order}
+    rows[kind]["epistemic share"] = rows[kind]["state share"] + rows[kind]["parameter share"]
+    rows[kind]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
+pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
 # ## Cost

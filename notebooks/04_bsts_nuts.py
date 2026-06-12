@@ -29,6 +29,9 @@
 
 # %%
 import json
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # notebook JAX work is light; leave the GPU to fits
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -260,6 +263,97 @@ for label, paths in (
         [crps_samples(y_test[i], paths[:, i, :]).mean() for i in range(y_test.shape[0])]
     )
 pd.Series(crps_rows, name="test CRPS (MW)").to_frame().round(1)
+
+# %% [markdown]
+# ## Aleatoric against epistemic uncertainty
+#
+# Conditional on a hyperparameter draw the model is linear-Gaussian, so
+# the predictive variance splits exactly into four sources: **parameter**
+# (posterior spread of per-draw predictive means) and **state** (precision
+# of the level and slope estimate at the origin) are epistemic, while
+# **process** (future trend innovations) and **observation** (the
+# heteroskedastic noise floor) are aleatoric. With NUTS as the reference,
+# the epistemic share doubles as an inference diagnostic: a surrogate that
+# under-states posterior spread reports too little epistemic uncertainty,
+# and that bias survives into any downstream decision that hinges on
+# whether more data would help.
+
+# %%
+from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.models import bsts
+from nemforecastdemand.models.predict import variance_decomposition
+from nemforecastdemand.splits import rolling_origins
+
+splits = load_splits(cfg.paths.processed)
+panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
+max_lag = max(cfg.features.demand_lags)
+fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+inputs = bsts.prepare_inputs(panel, cfg, fit_index)
+test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
+
+sites = tuple(s for s in bsts.HYPER_SITES if s not in ("level_init", "slope_init"))
+
+
+def with_marginalised_inits(draws: dict) -> dict:
+    zeros = np.zeros(draws["sigma_level"].shape[0], dtype=np.float32)
+    return {**draws, "level_init": zeros, "slope_init": zeros}
+
+
+nuts_flat = {
+    name: cold[f"post_{name}"].reshape(-1, *cold[f"post_{name}"].shape[2:]) for name in sites
+}
+keep = max(nuts_flat["sigma_level"].shape[0] // 1000, 1)
+draw_sets = {
+    "NUTS": with_marginalised_inits({name: value[::keep] for name, value in nuts_flat.items()}),
+    "mean-field": with_marginalised_inits(
+        {name: vi_fits["meanfield"][0][f"draw_{name}"] for name in sites}
+    ),
+    "full-rank": with_marginalised_inits(
+        {name: vi_fits["fullrank"][0][f"draw_{name}"] for name in sites}
+    ),
+}
+decomp = {
+    label: variance_decomposition(draws, inputs, panel, cfg, test_origins)
+    for label, draws in draw_sets.items()
+}
+
+component_order = ["observation", "process", "state", "parameter"]
+component_colours = {
+    "observation": "#cccccc",
+    "process": "#969696",
+    "state": "#8fc1e3",
+    "parameter": "#1f5673",
+}
+hours = (np.arange(cfg.horizon) + 1) / 2
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8), sharey=True)
+for ax, (label, parts) in zip(axes, decomp.items(), strict=True):
+    total = sum(parts.values())
+    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
+    ax.stackplot(
+        hours,
+        shares,
+        labels=component_order,
+        colors=[component_colours[n] for n in component_order],
+        alpha=0.95,
+    )
+    ax.set_title(label)
+    ax.set_xlabel("lead time (hours)")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(hours[0], hours[-1])
+axes[0].set_ylabel("share of predictive variance")
+axes[2].legend(loc="center right", fontsize=8)
+fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.04)
+save_figure(fig, "collapsed_variance_decomposition", cfg.paths.figures)
+plt.show()
+
+# %%
+rows = {}
+for label, parts in decomp.items():
+    total = sum(parts.values())
+    rows[label] = {f"{name} share": float((parts[name] / total).mean()) for name in component_order}
+    rows[label]["epistemic share"] = rows[label]["state share"] + rows[label]["parameter share"]
+    rows[label]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
+pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
 # ## Pricing the ADVI warm start

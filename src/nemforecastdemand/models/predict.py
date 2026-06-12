@@ -142,6 +142,59 @@ def predict_variants(
     return variants, y_true
 
 
+def variance_decomposition(
+    hyper_draws: dict[str, np.ndarray],
+    inputs: bsts.BstsInputs,
+    panel: pd.DataFrame,
+    cfg: Config,
+    origins: pd.DatetimeIndex,
+    weather_source: str = "forecast",
+) -> dict[str, np.ndarray]:
+    """Aleatoric and epistemic split of the predictive variance, in MW².
+
+    Wraps :func:`bsts.decompose_horizon_variance`: filters the history once
+    per draw, then splits each origin's horizon variance into ``parameter``
+    and ``state`` (epistemic: posterior uncertainty about hyperparameters
+    and the latent state, which more data shrinks) and ``process`` and
+    ``observation`` (aleatoric: future trend innovations and measurement
+    noise, irreducible under the model). Components sum to the predictive
+    variance of the simulated paths up to Monte Carlo error.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        The four components, each ``(O, H)`` in megawatts squared.
+    """
+    history = panel.index[
+        (panel.index >= inputs.index[0]) & (panel.index <= origins[-1] + pd.Timedelta("23.5h"))
+    ]
+    design_actual = build_design(panel, cfg, weather_source="actual").loc[history]
+    vdesign_actual = variance_design(panel, cfg, weather_source="actual").loc[history]
+    x_hist, z_hist = bsts.transform_design(inputs, design_actual, vdesign_actual)
+    y_hist = ((panel["demand_mw"].loc[history].to_numpy() - inputs.y_loc) / inputs.y_scale).astype(
+        np.float32
+    )
+    filtered_mean, filtered_cov = bsts.kalman_filter_states(
+        hyper_draws, y_hist, x_hist, z_hist, cfg.bsts
+    )
+    positions = history.get_indexer(origins)
+
+    horizons = [horizon_index(origin, cfg.horizon) for origin in origins]
+    design_h = build_design(panel, cfg, weather_source=weather_source).loc[history]
+    vdesign_h = variance_design(panel, cfg, weather_source=weather_source).loc[history]
+    transformed = [
+        bsts.transform_design(inputs, design_h.loc[index], vdesign_h.loc[index])
+        for index in horizons
+    ]
+    x_future = np.stack([x for x, _ in transformed])
+    z_future = np.stack([z for _, z in transformed])
+
+    parts = bsts.decompose_horizon_variance(
+        hyper_draws, filtered_mean, filtered_cov, positions, x_future, z_future, cfg.bsts
+    )
+    return {name: value * inputs.y_scale**2 for name, value in parts.items()}
+
+
 def fit_perturbation_models(panel: pd.DataFrame, train_index: pd.DatetimeIndex) -> dict:
     """Calibrate the perturbation models on training data only."""
     from nemforecastdemand.features.weather import fit_perturbation
