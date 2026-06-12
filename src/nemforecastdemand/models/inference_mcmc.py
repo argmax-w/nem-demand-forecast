@@ -141,10 +141,15 @@ def fit_nuts(
     rng = jax.random.PRNGKey(seed)
     start = time.perf_counter()
     mcmc.warmup(rng, init_params=init_params, collect_warmup=False, extra_fields=EXTRA_FIELDS)
+    # JAX dispatches asynchronously, so without an explicit barrier the timer
+    # records dispatch rather than computation and the warmup cost leaks into
+    # whichever later call happens to block first.
+    jax.block_until_ready(mcmc.post_warmup_state)
     timings["warmup_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
     mcmc.run(mcmc.post_warmup_state.rng_key, extra_fields=EXTRA_FIELDS)
+    jax.block_until_ready(mcmc.last_state)
     timings["sample_seconds"] = time.perf_counter() - start
 
     posterior = tree_to_float32(
