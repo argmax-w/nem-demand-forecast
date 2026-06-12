@@ -109,7 +109,7 @@ ax.bar(edges[:-1], density, width=np.diff(edges), align="edge", color=palette("f
 ax.axhline(1.0, color="grey", lw=0.8)
 ax.set_xlabel("PIT")
 ax.set_ylabel("relative density")
-ax.set_title("Validation PIT: modestly over-dispersed at the centre")
+ax.set_title("Validation PIT: wide at the centre, escaping upper tail")
 plt.show()
 
 # %% [markdown]
@@ -161,10 +161,14 @@ scores.round(3)
 # seasonal naive by a wide margin on every metric, so the machinery is
 # earning its keep. Second, perfect foresight buys only a modest CRPS
 # improvement over the archived forecast: at one day ahead, ECMWF weather
-# error is a minor part of the demand-forecast error budget. Third, coverage
-# runs above nominal, the same over-dispersion the PIT showed; the
-# homoskedastic Gaussian predictive cannot narrow its bands at the easy
-# times of day, a structural limitation the heteroskedastic BSTS addresses.
+# error is a minor part of the demand-forecast error budget. Third,
+# coverage runs below nominal at every level, unlike the mildly wide
+# validation centre: the test set sits in the early-winter demand ramp,
+# and a homoskedastic Gaussian trained on the eight weeks beforehand
+# under-states both the level shift and the spread, piling PIT mass into
+# the top decile. The full-year refit below recovers most of that
+# calibration, and the heteroskedastic BSTS attacks the same weakness
+# structurally.
 
 # %%
 fig, ax = plt.subplots(figsize=(7.5, 4))
@@ -193,6 +197,51 @@ ax.set_ylabel("CRPS (MW)")
 ax.set_title("Midday origins face the evening peak immediately")
 ax.legend()
 plt.show()
+
+# %% [markdown]
+# ## The training window: 56 days against the full year
+#
+# Every coefficient in this model is static, so the window length poses a
+# real trade-off: more history pins the coefficients down, but a regression
+# that must average over winter and summer cannot adapt its weather response
+# to the season being forecast, while a recent window acts as a local
+# approximation. The full-year fit reuses the order and basis selected
+# above, so the only thing that changes is the data. The same pairing exists
+# for LightGBM in notebook 05, which lets the window effect be separated
+# from the model class.
+
+# %%
+arrays_year, meta_year = load_artifact(cfg.paths.artifacts / "arima_year")
+window_scores = pd.DataFrame(
+    {
+        "56 days": score_variant(arrays["forecast_mean"], arrays["forecast_sd"]),
+        "full year": score_variant(arrays_year["forecast_mean"], arrays_year["forecast_sd"]),
+    }
+).T
+window_scores.round(3)
+
+# %%
+crps_year = crps_gaussian(arrays["y_test"], arrays_year["forecast_mean"], arrays_year["forecast_sd"])
+fig, ax = plt.subplots(figsize=(7.5, 4))
+horizon_curve(ax, crps_headline, "56-day window", palette("demand"))
+horizon_curve(ax, crps_year, "full-year window", palette("accent"))
+ax.set_ylabel("CRPS (MW)")
+ax.set_title("Training window and lead time, headline weather")
+ax.legend()
+save_figure(fig, "arima_window_comparison", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# The year wins: the headline CRPS moves from 301 to 267 MW, the
+# perfect-foresight bound moves with it and 95% coverage recovers from
+# 0.89 to 0.95, so pinning the coefficients down on twelve months of
+# regimes buys more than seasonal locality loses. The
+# gain is modest, though, next to what the same swap does for LightGBM in
+# notebook 05, where the trees roughly halve their CRPS: a linear design
+# can only average the regimes it is shown, while the trees keep them
+# apart. Both fits stay in the comparison; the 56-day fit is the
+# like-for-like partner for the explicit-state BSTS, the full-year fit for
+# the collapsed one.
 
 # %% [markdown]
 # ## What a forecast looks like
@@ -244,7 +293,8 @@ plt.show()
 # %%
 pd.Series(
     {
-        "final fit (s)": meta["timings_seconds"]["final_fit"],
+        "final fit, 56 days (s)": meta["timings_seconds"]["final_fit"],
+        "final fit, full year (s)": meta_year["timings_seconds"]["final_fit_year"],
         "forecast per origin (s)": meta["forecast_seconds_per_origin"],
         "exogenous columns": meta["n_exog"],
         "chosen order": str(tuple(meta["chosen_order"])),
@@ -260,5 +310,11 @@ pd.Series(
 #   the harmonics remain the project default.
 # - The baseline beats the seasonal naive decisively and loses little when
 #   moving from perfect-foresight weather to the real archived forecast.
-# - Its single Gaussian variance is visibly over-dispersed at easy hours,
-#   which is precisely the opening for the heteroskedastic BSTS.
+# - More history helps even this static design: the full-year refit takes
+#   the headline CRPS from 301 to 267 MW for a three-minute fit, a far
+#   smaller gain than the year hands the gradient-boosted model in
+#   notebook 05.
+# - The single Gaussian variance cannot track the test period's winter
+#   ramp: the 56-day fit under-covers at every level while the full-year
+#   fit restores the tails. A state-dependent variance is precisely the
+#   opening the heteroskedastic BSTS exploits.
