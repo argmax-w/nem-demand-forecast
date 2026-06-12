@@ -71,6 +71,10 @@ class FeatureConfig:
     daily_rbf_centres: int
     weekly_rbf_centres: int
     demand_lags: tuple[int, ...]
+    # Daily harmonics interacted with degree days and the weekend flag,
+    # letting the temperature response and the weekend profile vary by
+    # time of day. Zero disables the block.
+    interaction_harmonics: int = 0
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,7 @@ def load_config(path: str | Path | None = None) -> Config:
             daily_rbf_centres=int(raw["features"]["daily_rbf_centres"]),
             weekly_rbf_centres=int(raw["features"]["weekly_rbf_centres"]),
             demand_lags=tuple(int(lag) for lag in raw["features"]["demand_lags"]),
+            interaction_harmonics=int(raw["features"].get("interaction_harmonics", 0)),
         ),
         arima=ArimaConfig(
             candidate_orders=_as_int_triples(raw["arima"]["candidate_orders"]),

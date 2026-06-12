@@ -442,6 +442,97 @@ plt.show()
 # switch away, and notebook 02 repeats this comparison inside the full
 # ARIMA model.
 #
+# ## What stays non-linear after the linear design
+#
+# A design that enters every model linearly should be checked for the
+# interactions it cannot represent. Fitting the additive design on train
+# and tabulating the residual mean by time-of-day block and temperature
+# band gives a direct signature: a purely additive temperature response
+# would leave these cells near zero.
+
+# %%
+plain_cfg = replace(cfg, features=replace(cfg.features, interaction_harmonics=0))
+design = build_design(panel, plain_cfg, weather_source="actual")
+train_design = design.loc[splits["train"]].dropna()
+train_matrix = np.column_stack([np.ones(len(train_design)), train_design.to_numpy()])
+coef, *_ = np.linalg.lstsq(train_matrix, y_all.loc[train_design.index].to_numpy(), rcond=None)
+resid = pd.Series(
+    y_all.loc[train_design.index].to_numpy() - train_matrix @ coef, index=train_design.index
+)
+
+local_resid = resid.index.tz_convert(LOCAL_TZ)
+signature = pd.DataFrame(
+    {
+        "resid": resid.to_numpy(),
+        "block": pd.cut(
+            local_resid.hour,
+            [0, 6, 12, 18, 24],
+            labels=["night", "morning", "afternoon", "evening"],
+            right=False,
+        ),
+        "temp": pd.cut(
+            train_design["temp_c"],
+            [-5, 10, 15, 20, 25, 45],
+            labels=["<10C", "10-15C", "15-20C", "20-25C", ">25C"],
+        ).to_numpy(),
+        "weekend": local_resid.dayofweek >= 5,
+        "hour": local_resid.hour,
+    }
+)
+pivot = signature.pivot_table(
+    values="resid", index="block", columns="temp", aggfunc="mean", observed=True
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+im = axes[0].imshow(pivot.to_numpy(), cmap="RdBu_r", vmin=-450, vmax=450, aspect="auto")
+axes[0].set_xticks(range(pivot.shape[1]), pivot.columns)
+axes[0].set_yticks(range(pivot.shape[0]), pivot.index)
+fig.colorbar(im, ax=axes[0], label="mean residual (MW)")
+axes[0].set_title("Temperature response flips sign by time of day")
+
+weekend_gap = signature.pivot_table(values="resid", index="hour", columns="weekend", aggfunc="mean")
+axes[1].plot(weekend_gap.index, weekend_gap[False], color=palette("demand"), label="weekday")
+axes[1].plot(weekend_gap.index, weekend_gap[True], color=palette("accent"), label="weekend")
+axes[1].set_xlabel("local Sydney hour")
+axes[1].set_ylabel("mean residual (MW)")
+axes[1].set_title("The weekend morning ramp the weekly basis misses")
+axes[1].legend()
+fig.tight_layout()
+save_figure(fig, "nonlinearity_signature", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# Two clean interaction signatures: hot evenings sit hundreds of megawatts
+# above the additive fit while hot nights sit below it (the
+# air-conditioning load follows the clock, not just the thermometer), and
+# weekend mornings run far from the weekday profile. Both are still
+# linear in parameters once the right columns exist: degree days and a
+# weekend flag interacted with a small daily Fourier basis. The size of
+# that basis is selected on validation, fitted on train only.
+
+# %%
+interaction_rows = {}
+for n_ix in (0, 2, 3):
+    ix_cfg = replace(cfg, features=replace(cfg.features, interaction_harmonics=n_ix))
+    design = build_design(panel, ix_cfg, weather_source="actual")
+    train_design = design.loc[splits["train"]].dropna()
+    val_design = design.loc[splits["validation"]]
+    train_matrix = np.column_stack([np.ones(len(train_design)), train_design.to_numpy()])
+    val_matrix = np.column_stack([np.ones(len(val_design)), val_design.to_numpy()])
+    coef, *_ = np.linalg.lstsq(train_matrix, y_all.loc[train_design.index].to_numpy(), rcond=None)
+    errors = y_all.loc[val_design.index] - val_matrix @ coef
+    interaction_rows[f"{n_ix} interaction harmonics"] = {
+        "design columns": design.shape[1],
+        "validation MAE (MW)": float(errors.abs().mean()),
+        "validation RMSE (MW)": float(np.sqrt((errors**2).mean())),
+    }
+pd.DataFrame(interaction_rows).T
+
+# %% [markdown]
+# Two harmonics capture the gain; more buys nothing. The interaction block
+# is enabled in the configuration, so every model downstream (classical,
+# boosted, Bayesian) sees the same enriched design.
+#
 # ## Summary
 #
 # - The half-hourly grid is complete, duplicate-free and verified against
@@ -453,6 +544,10 @@ plt.show()
 # - Demand shows daily, weekly and holiday structure, a U-shaped temperature
 #   response around a 17 to 20 C comfort band and solar suppression of
 #   midday load, motivating the configured feature set.
+# - The additive design leaves two interaction signatures in its train
+#   residuals (temperature response varying by time of day, a distinct
+#   weekend morning ramp); degree-day and weekend interactions with two
+#   daily harmonics close them, selected on validation.
 # - Day-ahead forecast errors are material but modest, quantified here to
 #   calibrate the perturbation sweep.
 # - Train, validation and test splits are written, validated and committed.

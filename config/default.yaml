@@ -56,6 +56,7 @@ features:
   # Demand lags, in half-hourly steps. Both stay behind the origin across a
   # 48-step horizon, so no recursive feedback is needed at forecast time.
   demand_lags: [48, 336]
+  interaction_harmonics: 2 # degree days and weekend flag x daily harmonics
 
 arima:
   # Candidate (p, d, q) orders for the regression residuals, selected on the

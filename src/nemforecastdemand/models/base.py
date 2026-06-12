@@ -26,7 +26,12 @@ import numpy as np
 import pandas as pd
 
 from nemforecastdemand.config import Config
-from nemforecastdemand.features.calendar import fourier_design, local_phases, seasonal_design
+from nemforecastdemand.features.calendar import (
+    LOCAL_TZ,
+    fourier_design,
+    local_phases,
+    seasonal_design,
+)
 from nemforecastdemand.features.weather import degree_days
 from nemforecastdemand.splits import horizon_index
 
@@ -110,6 +115,21 @@ def build_design(
         ),
         panel["is_holiday"].astype(np.float64).to_frame(),
     ]
+    if cfg.features.interaction_harmonics > 0:
+        # The train-split residuals show the temperature response flipping
+        # sign by time of day and a weekend-specific morning ramp, so the
+        # degree days and the weekend flag interact with a small daily
+        # basis. Everything stays linear in parameters and pointwise.
+        daily, _ = local_phases(panel.index)
+        basis = fourier_design(daily, cfg.features.interaction_harmonics, "ix")
+        basis.index = panel.index
+        weekend = (panel.index.tz_convert(LOCAL_TZ).dayofweek >= 5).astype(np.float64)
+        interactions = {"is_weekend": weekend}
+        for column in basis.columns:
+            interactions[f"cooling_{column}"] = degrees["cooling_deg"] * basis[column]
+            interactions[f"heating_{column}"] = degrees["heating_deg"] * basis[column]
+            interactions[f"weekend_{column}"] = weekend * basis[column]
+        blocks.append(pd.DataFrame(interactions, index=panel.index))
     return pd.concat(blocks, axis=1).astype(np.float64)
 
 
