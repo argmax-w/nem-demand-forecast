@@ -2,8 +2,9 @@
 # # 03. The Bayesian structural time-series model, fitted by ADVI
 #
 # The generative model is defined once in `nemforecastdemand.models.bsts`
-# and shared verbatim with the NUTS fits of notebook 04, so everything that
-# differs between those notebooks is the inference algorithm. On demand
+# and shared with notebook 04, which marginalises its latent states and
+# fits it by NUTS on the full training year, so everything that differs
+# between these notebooks is the inference strategy. On demand
 # standardised over the fitting window:
 #
 # $$
@@ -124,8 +125,10 @@ pd.DataFrame(
 # With both surrogates fitted to the same model, the marginal standard
 # deviations of the hyperparameters can be compared directly, and the
 # full-rank covariance shows which correlations the mean-field family had
-# to discard. (NUTS will adjudicate which family is closer to the truth in
-# notebook 04.)
+# to discard. Here the surrogates can only be compared with each other:
+# on this explicit-state geometry NUTS does not finish (notebook 04 opens
+# with that finding), so the adjudication against a reference posterior
+# happens on the collapsed formulation there.
 
 # %%
 hyper_names = ["sigma_level", "sigma_slope", "phi", "gamma0", "level_init", "slope_init"]
@@ -291,5 +294,7 @@ pd.DataFrame(
 # - The heteroskedastic head learns a plausible daily risk profile, and the
 #   Bayesian predictive is competitive with the classical baseline before
 #   any MCMC is spent.
-# - Notebook 04 fits the same model by NUTS, adjudicates the two surrogate
-#   families against the reference posterior and prices the warm start.
+# - NUTS cannot certify any of this on the explicit states: its cold run
+#   was stopped after seventeen hours, the finding that opens notebook 04.
+#   The states are marginalised there, the full year fitted, and the
+#   surrogate adjudication and warm-start pricing run on that formulation.

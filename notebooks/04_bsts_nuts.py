@@ -1,51 +1,121 @@
+# ---
+# jupyter:
+#   jupytext:
+#     cell_metadata_filter: -all
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.3
+#   kernelspec:
+#     display_name: Python (nem-demand-forecast)
+#     language: python
+#     name: nem-demand-forecast
+# ---
+
 # %% [markdown]
 # # 04. The same model, fitted by NUTS
 #
-# Identical generative model, identical data, identical priors to notebook
-# 03; only the inference changes. Hamiltonian Monte Carlo with the No-U-Turn
-# Sampler, four chains run vectorised on the GPU, is treated as the
-# reference posterior: asymptotically exact, with the usual battery of
-# convergence diagnostics standing guard. This notebook reads the artifacts
-# of `scripts/fit_bsts_nuts.py`, examines sampler health, adjudicates the
-# two ADVI surrogates against the reference posterior and prices the ADVI
-# warm start honestly.
+# Identical generative model, identical priors; only the inference and the
+# handling of the latent states change. This notebook is the
+# reference-posterior side of the project: NUTS with four vectorised chains
+# and a full diagnostic battery, the two ADVI surrogates adjudicated against
+# it, the warm start priced honestly and the hardware question settled. It
+# reads the artifacts of `scripts/fit_bsts_collapsed.py`.
 #
-# The non-centred parameterisation earns its keep here: NUTS explores a
-# roughly 5,400-dimensional latent space whose geometry, with the funnel
-# removed, is close enough to Gaussian for large steps and shallow trees.
+# It opens, though, with the result that shaped it: on the explicit-state
+# formulation that notebook 03 fitted by ADVI in minutes, NUTS is not
+# practically available at all.
 
 # %%
+import json
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
 from nemforecastdemand.evaluation.diagnostics import time_to_target_ess
 from nemforecastdemand.evaluation.metrics import crps_samples
-from nemforecastdemand.models import bsts
 from nemforecastdemand.plotting import palette, save_figure, setup_style
 from nemforecastdemand.utils import load_artifact
 
 setup_style()
 cfg = load_config()
-splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
-cold, cold_meta = load_artifact(cfg.paths.artifacts / "bsts_nuts_cold")
+cold, cold_meta = load_artifact(cfg.paths.artifacts / "bsts_collapsed_nuts_cold")
 vi_fits = {
-    kind: load_artifact(cfg.paths.artifacts / f"bsts_vi_{kind}")
+    kind: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{kind}")
     for kind in ("meanfield", "fullrank")
 }
 
 # %% [markdown]
+# ## The explicit states are where NUTS stops
+#
+# The explicit formulation samples every half hour's level and slope
+# innovation directly: with the hyperparameters that is roughly 5,400
+# dimensions for its 56-day window, and every additional day adds 96 more.
+# ADVI handles that geometry comfortably. NUTS does not. The cold run (four
+# vectorised chains, 1,000 warmup plus 1,000 sampling iterations, maximum
+# tree depth 10) was stopped after seventeen hours on the RTX 4000 Ada
+# without completing; the arithmetic is unforgiving, because a depth-10
+# trajectory costs up to 1,023 gradient evaluations per iteration per
+# chain, and each gradient back-propagates through the full 2,688-step
+# scan. That is not a tuning accident to be worked around but the honest
+# price of asking a trajectory-based sampler to explore thousands of
+# correlated state dimensions, and it is reported here as a finding.
+#
+# The remedy is not a bigger GPU. Conditional on the hyperparameters the
+# trend is linear-Gaussian, so a Kalman filter inside the likelihood
+# integrates the states out exactly: the **collapsed** formulation samples
+# only the roughly fifty hyperparameters, at the cost of running a
+# sequential filter over the data inside every gradient. The cost moves
+# from dimension to gradient, the dimension count stops depending on the
+# window length, and the full training year becomes affordable; the states
+# are recovered afterwards by the same filter, which is also how every
+# prediction in this project is Rao-Blackwellised. Same priors, same
+# structure, more data, and a posterior NUTS can actually certify.
+
+# %%
+explicit_vi_meta = {
+    kind: json.loads((cfg.paths.artifacts / f"bsts_vi_{kind}.json").read_text())
+    for kind in ("meanfield", "fullrank")
+}
+explicit_dims = 2 * cfg.bsts.train_days * 48 + 55
+collapsed_dims = sum(row["size"] for row in cold_meta["site_summary"])
+timing = cold_meta["timings_seconds"]
+pd.DataFrame(
+    {
+        "explicit states, 56 days": {
+            "latent dimensions": f"~{explicit_dims:,}",
+            "data half hours": f"{cfg.bsts.train_days * 48:,}",
+            "ADVI mean-field fit": (
+                f"{explicit_vi_meta['meanfield']['timings_seconds']['fit_seconds']:,.0f} s"
+            ),
+            "NUTS cold (1,000 + 1,000)": "stopped after 17 h, incomplete",
+        },
+        "collapsed states, full year": {
+            "latent dimensions": f"{collapsed_dims}",
+            "data half hours": f"{cold_meta['fit_steps']:,}",
+            "ADVI mean-field fit": (
+                f"{vi_fits['meanfield'][1]['timings_seconds']['fit_seconds']:,.0f} s"
+            ),
+            "NUTS cold (1,000 + 1,000)": (
+                f"{timing['warmup_seconds'] + timing['sample_seconds']:,.0f} s"
+            ),
+        },
+    }
+)
+
+# %% [markdown]
 # ## Sampler health
 #
-# Split R-hat and bulk and tail effective sample sizes per site (vector
-# sites report their weakest element), divergences, energy-based fraction
-# of missing information (E-BFMI) and tree-depth saturation per chain. The
-# things to look for: R-hat at 1.00, ESS comfortably in the hundreds,
-# zero or near-zero divergences, E-BFMI above 0.3 and no saturated trees.
+# Everything below is the collapsed model on the full training year. Split
+# R-hat and bulk and tail effective sample sizes per site (vector sites
+# report their weakest element), divergences, energy-based fraction of
+# missing information (E-BFMI) and tree-depth saturation per chain. The
+# things to look for: R-hat at 1.00, ESS comfortably in the hundreds, zero
+# or near-zero divergences, E-BFMI above 0.3 and no saturated trees.
 
 # %%
 summary = pd.DataFrame(cold_meta["site_summary"]).set_index("site")
@@ -53,7 +123,6 @@ summary.round(4)
 
 # %%
 health = pd.DataFrame(cold_meta["chain_health"]).set_index("chain")
-timing = cold_meta["timings_seconds"]
 display_cols = pd.DataFrame(
     {
         "value": {
@@ -106,7 +175,9 @@ plt.show()
 # ## ADVI against the reference posterior
 #
 # The question notebook 03 could not answer: which surrogate family is
-# closer to the truth? Marginals first, then the correlation structure.
+# closer to the truth? Here both guides fitted the collapsed model on the
+# same full year that NUTS certified, so the comparison is clean. Marginals
+# first, then the correlation structure.
 
 # %%
 compare_sites = ["sigma_level", "sigma_slope", "phi", "gamma0"]
@@ -133,7 +204,7 @@ plt.show()
 
 # %%
 rows = {}
-for site in [*compare_sites, "level_init", "slope_init"]:
+for site in compare_sites:
     nuts_sd = cold[f"post_{site}"].ravel().std()
     rows[site] = {
         "sd NUTS": nuts_sd,
@@ -171,51 +242,19 @@ pd.DataFrame(
 ).round(3)
 
 # %% [markdown]
-# ## The latent trend under both inference paths
-
-# %%
-fit_index = panel.index[panel.index < splits["test"].index[0]][-cfg.bsts.train_days * 48 :]
-inputs = bsts.prepare_inputs(panel, cfg, fit_index)
-times = fit_index.tz_convert("Australia/Brisbane")
-level_nuts = cold["post_level"].reshape(-1, cold["post_level"].shape[-1])
-
-fig, ax = plt.subplots(figsize=(11, 4))
-ax.fill_between(
-    times,
-    np.quantile(level_nuts, 0.05, axis=0) * inputs.y_scale + inputs.y_loc,
-    np.quantile(level_nuts, 0.95, axis=0) * inputs.y_scale + inputs.y_loc,
-    color="black",
-    alpha=0.18,
-    label="NUTS 90% band",
-)
-for kind, colour in (("meanfield", palette("demand")), ("fullrank", palette("accent"))):
-    arrays, _ = vi_fits[kind]
-    ax.plot(
-        times,
-        arrays["level_mean"] * inputs.y_scale + inputs.y_loc,
-        color=colour,
-        lw=1.0,
-        label=f"{kind} mean",
-    )
-ax.set_ylabel("trend level (MW)")
-ax.set_title("Latent level: ADVI means inside the NUTS band")
-ax.legend()
-plt.show()
-
-# %% [markdown]
 # ## Predictive accuracy, NUTS against ADVI
 #
 # Same Rao-Blackwellised prediction pipeline, same test origins, archived
 # forecast weather. The full cross-model table lives in notebook 05; this
-# is the inference-to-inference comparison.
+# is the inference-to-inference comparison at a fixed model.
 
 # %%
 y_test = cold["y_test"]
 crps_rows = {}
 for label, paths in (
-    ("BSTS NUTS", cold["forecast_paths"]),
-    ("BSTS ADVI mean-field", vi_fits["meanfield"][0]["forecast_paths"]),
-    ("BSTS ADVI full-rank", vi_fits["fullrank"][0]["forecast_paths"]),
+    ("collapsed NUTS", cold["forecast_paths"]),
+    ("collapsed ADVI mean-field", vi_fits["meanfield"][0]["forecast_paths"]),
+    ("collapsed ADVI full-rank", vi_fits["fullrank"][0]["forecast_paths"]),
 ):
     crps_rows[label] = np.mean(
         [crps_samples(y_test[i], paths[:, i, :]).mean() for i in range(y_test.shape[0])]
@@ -239,24 +278,24 @@ pd.Series(crps_rows, name="test CRPS (MW)").to_frame().round(1)
 
 # %%
 target = cfg.warm_start.target_bulk_ess
-runs = {"cold": (None, cold_meta)}
+runs = {"cold": cold_meta}
 for kind in ("meanfield", "fullrank"):
     for reduced in cfg.warm_start.reduced_warmup:
-        stem = f"bsts_nuts_warm_{kind}_w{reduced}"
-        runs[f"warm {kind} w={reduced}"] = (None, load_artifact(cfg.paths.artifacts / stem)[1])
+        stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+        runs[f"warm {kind} w={reduced}"] = load_artifact(cfg.paths.artifacts / stem)[1]
 
 rows = {}
-for name, (_, meta) in runs.items():
-    timing = meta["timings_seconds"]
+for name, meta in runs.items():
+    run_timing = meta["timings_seconds"]
     advi_seconds = meta.get("advi_seconds", 0.0)
     to_target = time_to_target_ess(
-        timing["warmup_seconds"], timing["sample_seconds"], meta["min_bulk_ess"], target
+        run_timing["warmup_seconds"], run_timing["sample_seconds"], meta["min_bulk_ess"], target
     )
     quality_ok = meta["max_rhat"] < cfg.warm_start.rhat_threshold and meta["total_divergences"] == 0
     rows[name] = {
         "ADVI (s)": advi_seconds,
-        "warmup (s)": timing["warmup_seconds"],
-        "sampling (s)": timing["sample_seconds"],
+        "warmup (s)": run_timing["warmup_seconds"],
+        "sampling (s)": run_timing["sample_seconds"],
         "min bulk ESS": meta["min_bulk_ess"],
         "max R-hat": meta["max_rhat"],
         "divergences": meta["total_divergences"],
@@ -284,157 +323,53 @@ plt.show()
 # holds (green bars). Any red bar is a warm start that bought speed with
 # broken mixing or divergences, the failure mode flagged in the brief: a
 # surrogate that under-estimates variance hands the sampler a mis-scaled
-# mass matrix. The conclusion belongs to whatever the numbers above say,
-# and notebook 05 carries the timing column into the final comparison.
-#
-# ## Collapsing the states: dimension against data
-#
-# The explicit-state formulation is the demanding inference exercise, but
-# it caps the data window: every half hour adds two latent dimensions, so a
-# year of history would put NUTS in a 70,000-dimensional space and rule out
-# the full-rank guide entirely. The production alternative marginalises the
-# states analytically (conditional on the hyperparameters the trend is
-# linear-Gaussian, so a Kalman filter inside the likelihood integrates them
-# out exactly) and samples only the roughly fifty hyperparameters. The cost
-# moves from dimension to gradient: every leapfrog now runs a sequential
-# filter over fifteen thousand steps. Same priors, same structure, full
-# training year.
-
-# %%
-collapsed, collapsed_meta = load_artifact(cfg.paths.artifacts / "bsts_collapsed_nuts_cold")
-
-
-def cold_row(meta: dict, dims: int, steps: int) -> dict:
-    timing = meta["timings_seconds"]
-    return {
-        "latent dimensions": dims,
-        "data half hours": steps,
-        "warmup (s)": timing["warmup_seconds"],
-        "sampling (s)": timing["sample_seconds"],
-        "min bulk ESS": meta["min_bulk_ess"],
-        "ESS per s": meta["min_bulk_ess"] / timing["sample_seconds"],
-        "max R-hat": meta["max_rhat"],
-        "divergences": meta["total_divergences"],
-    }
-
-
-explicit_dims = sum(row["size"] for row in cold_meta["site_summary"])
-collapsed_dims = sum(row["size"] for row in collapsed_meta["site_summary"])
-pd.DataFrame(
-    {
-        "explicit states, 56 days": cold_row(cold_meta, explicit_dims, cfg.bsts.train_days * 48),
-        "collapsed states, full year": cold_row(
-            collapsed_meta, collapsed_dims, collapsed_meta["fit_steps"]
-        ),
-    }
-).T.round(3)
-
-# %% [markdown]
-# The hyperparameter posteriors are not expected to agree exactly: the
-# collapsed fit sees a year of data, so its innovation scales answer "how
-# much does the level drift through whole seasons" while the explicit fit
-# answers the same question for one recent eight-week window. The contrast
-# is therefore formulation and window together, which is the operational
-# question: what does the stiff short-window trend understate?
-
-# %%
-fig, axes = plt.subplots(1, len(compare_sites), figsize=(13, 3.2))
-for ax, site in zip(axes, compare_sites, strict=True):
-    explicit_draws = cold[f"post_{site}"].ravel()
-    collapsed_draws = collapsed[f"post_{site}"].ravel()
-    grid = np.linspace(
-        min(explicit_draws.min(), collapsed_draws.min()),
-        max(explicit_draws.max(), collapsed_draws.max()),
-        120,
-    )
-    centres = (grid[:-1] + grid[1:]) / 2
-    for label, draws, colour in (
-        ("explicit, 56 d", explicit_draws, "black"),
-        ("collapsed, year", collapsed_draws, palette("temperature")),
-    ):
-        ax.plot(
-            centres,
-            np.histogram(draws, bins=grid, density=True)[0],
-            label=label,
-            color=colour,
-            lw=1.2,
-        )
-    ax.set_title(site)
-    ax.set_yticks([])
-axes[0].legend()
-fig.suptitle("NUTS posteriors: explicit 56-day window against collapsed full year", y=1.04)
-save_figure(fig, "explicit_vs_collapsed_posteriors", cfg.paths.figures)
-plt.show()
-
-# %% [markdown]
-# The collapsed warm starts repeat the accounting at fifty dimensions,
-# where the surrogate covariance is cheap to estimate well; against the
-# explicit table above, they show how much of the warm start's value
-# depends on the dimensionality of the space being warmed.
-
-# %%
-rows = {}
-collapsed_runs = {"collapsed cold": collapsed_meta}
-for kind in ("meanfield", "fullrank"):
-    for reduced in cfg.warm_start.reduced_warmup:
-        stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
-        collapsed_runs[f"collapsed warm {kind} w={reduced}"] = load_artifact(
-            cfg.paths.artifacts / stem
-        )[1]
-for name, meta in collapsed_runs.items():
-    timing = meta["timings_seconds"]
-    advi_seconds = meta.get("advi_seconds", 0.0)
-    to_target = time_to_target_ess(
-        timing["warmup_seconds"], timing["sample_seconds"], meta["min_bulk_ess"], target
-    )
-    rows[name] = {
-        "ADVI (s)": advi_seconds,
-        "warmup (s)": timing["warmup_seconds"],
-        "sampling (s)": timing["sample_seconds"],
-        "min bulk ESS": meta["min_bulk_ess"],
-        "max R-hat": meta["max_rhat"],
-        "divergences": meta["total_divergences"],
-        f"total to ESS {target:.0f} (s)": advi_seconds + to_target,
-        "quality met": meta["max_rhat"] < cfg.warm_start.rhat_threshold
-        and meta["total_divergences"] == 0,
-    }
-pd.DataFrame(rows).T.round(3)
+# mass matrix. At fifty dimensions the surrogate covariance is cheap to
+# estimate well, which is exactly the regime where the warm start should
+# shine; notebook 05 carries the timing column into the final comparison.
 
 # %% [markdown]
 # ## GPU against CPU
 #
-# The same fits, same code, same XLA pipeline, on the RTX 4000 Ada versus
-# 32 CPU cores. ADVI is measured directly at matched step counts; NUTS uses
-# short matched runs and reports the leapfrog rate, the quantity that scales
-# to any run length.
+# The entire collapsed suite was refitted on 32 CPU cores with the same
+# code, the same settings and the same explicit timing barriers, so every
+# row is a like-for-like wall-clock comparison. ADVI rows report the fit;
+# NUTS rows report warmup plus sampling.
+
 
 # %%
+def wall_seconds(meta: dict) -> float:
+    t = meta["timings_seconds"]
+    if "fit_seconds" in t:
+        return t["fit_seconds"]
+    return t["warmup_seconds"] + t["sample_seconds"]
+
+
+stems = {
+    "ADVI mean-field": "bsts_collapsed_vi_meanfield",
+    "ADVI full-rank": "bsts_collapsed_vi_fullrank",
+    "NUTS cold": "bsts_collapsed_nuts_cold",
+}
+for kind in ("meanfield", "fullrank"):
+    for reduced in cfg.warm_start.reduced_warmup:
+        stems[f"NUTS warm {kind} w={reduced}"] = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+
 bench_rows = {}
-for device in ("gpu", "cpu"):
-    try:
-        _, nuts_bench = load_artifact(cfg.paths.artifacts / f"bsts_nuts_bench_{device}")
-        _, vi_bench = load_artifact(cfg.paths.artifacts / f"bsts_vi_bench_meanfield_{device}")
-        bench_rows[device] = {
-            "NUTS leapfrogs per s": nuts_bench["leapfrogs_per_second"],
-            "ADVI steps per s": vi_bench["timings_seconds"]["steps_per_second"],
-        }
-    except FileNotFoundError:
-        continue
-bench = pd.DataFrame(bench_rows).T
-if {"gpu", "cpu"} <= set(bench.index):
-    bench.loc["speed-up"] = bench.loc["gpu"] / bench.loc["cpu"]
-bench.round(2)
+for label, stem in stems.items():
+    gpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
+    cpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.cpu.json").read_text())
+    gpu_s, cpu_s = wall_seconds(gpu_meta), wall_seconds(cpu_meta)
+    bench_rows[label] = {"GPU (s)": gpu_s, "CPU (s)": cpu_s, "speed-up": cpu_s / gpu_s}
+pd.DataFrame(bench_rows).T.round(2)
 
 # %% [markdown]
 # ## Summary
 #
-# - NUTS passes its full diagnostic battery on the 5,400-dimensional
-#   non-centred model, earning its role as the reference posterior.
-# - Against that reference, full-rank ADVI recovers marginal scales and the
-#   leading correlations; mean-field is visibly narrower on correlated
-#   hyperparameters, the predicted failure mode.
-# - All three posteriors forecast almost equally well here, which is itself
-#   a finding: the predictive task is dominated by the regression and the
-#   filtered state, both of which ADVI pins down cheaply.
-# - The warm-start verdict, at matched quality and with the ADVI bill paid,
-#   is in the table above, green where legitimate.
+# - On the explicit-state formulation NUTS is intractable in practice: the
+#   cold run was stopped after seventeen hours without completing, while
+#   ADVI fitted the same geometry in minutes. The finding motivates the
+#   collapsed formulation rather than a workaround.
+# - On the collapsed model NUTS passes its full diagnostic battery on a
+#   full year of data and stands as the reference posterior.
+# - The surrogate adjudication, the warm-start accounting at matched
+#   quality and the hardware verdict are in the tables above; their
+#   narratives are written against the executed numbers.
