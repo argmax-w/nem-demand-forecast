@@ -20,6 +20,10 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
     parser.add_argument("--time-harmonics", type=int, default=6)
     parser.add_argument("--temp-basis", type=int, default=8)
+    # The kernel hyperparameters couple with the weights more strongly
+    # than anything in the plain model, so the reference run gets a full
+    # warmup by default rather than the reduced schedule.
+    parser.add_argument("--reference-warmup", type=int, default=None)
     args = parser.parse_args()
 
     from dataclasses import replace
@@ -117,8 +121,18 @@ def main() -> None:
             },
         )
 
-    reference_warmup = max(cfg.warm_start.reduced_warmup)
+    reference_warmup = (
+        args.reference_warmup if args.reference_warmup is not None else cfg.nuts.warmup
+    )
+    # Positions-only warm start: the guide places the chains in the right
+    # basin (cold chains inherit the AR model's degenerate modes), but the
+    # mass matrix is left to adapt because the guide covariance cannot
+    # represent the funnel between the kernel hyperparameters and the
+    # weights, and freezing it caps the attainable mixing.
+    from dataclasses import replace as dc_replace
+
     warm = warm_start_from_vi(vi_fits["fullrank"], cfg.nuts.chains, seed=cfg.seed + 20)
+    warm = dc_replace(warm, freeze_mass=False)
     run = fit_nuts(model_fn, cfg.nuts, seed=cfg.seed + 30, warmup=reference_warmup, warm_start=warm)
     summary = run.summary().reset_index()
     print(

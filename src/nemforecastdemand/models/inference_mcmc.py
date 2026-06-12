@@ -42,12 +42,20 @@ EXTRA_FIELDS = ("diverging", "energy", "num_steps", "accept_prob")
 
 @dataclass
 class WarmStart:
-    """Initialisation derived from a fitted surrogate."""
+    """Initialisation derived from a fitted surrogate.
+
+    With ``freeze_mass`` the surrogate covariance becomes the fixed
+    inverse mass matrix and mass adaptation is disabled; without it the
+    surrogate supplies starting positions only and NUTS adapts its own
+    mass matrix, which suits posteriors whose geometry the guide cannot
+    capture (hierarchical funnels).
+    """
 
     init_params: dict[str, np.ndarray]
     inverse_mass_matrix: np.ndarray
     dense: bool
     source: str
+    freeze_mass: bool = True
 
 
 @dataclass
@@ -126,9 +134,10 @@ def fit_nuts(
     }
     init_params = None
     if warm_start is not None:
-        kernel_kwargs["inverse_mass_matrix"] = jax.numpy.asarray(warm_start.inverse_mass_matrix)
-        kernel_kwargs["dense_mass"] = warm_start.dense
-        kernel_kwargs["adapt_mass_matrix"] = False
+        if warm_start.freeze_mass:
+            kernel_kwargs["inverse_mass_matrix"] = jax.numpy.asarray(warm_start.inverse_mass_matrix)
+            kernel_kwargs["dense_mass"] = warm_start.dense
+            kernel_kwargs["adapt_mass_matrix"] = False
         init_params = {
             name: jax.numpy.asarray(value) for name, value in warm_start.init_params.items()
         }
