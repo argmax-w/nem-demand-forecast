@@ -491,18 +491,26 @@ pd.DataFrame(warm_rows).T.round(2)
 # %% [markdown]
 # ## Conclusions
 #
-# - Every model clears the naive floor; the Bayesian AR(1) beats the
-#   classical baseline on CRPS and the bootstrap says how much of each
-#   gap is signal.
-# - The ablation chain attributes the Bayesian gain: same structure with
-#   a constant scale lands near ARIMA, and the heteroskedastic head
-#   provides the advantage.
-# - Inference choice barely moves prediction at this model: all three
-#   posteriors forecast within Monte Carlo error of each other. The
-#   differences live in the posterior itself and in what it costs
-#   (notebook 04).
-# - LightGBM remains the sharpest point forecaster; its coverage and PIT
-#   are where that sharpness is paid for, and it offers no decomposition
-#   of its uncertainty.
-# - Conclusions above are revised against the executed numbers below the
-#   final run.
+# - Every model clears the naive floor. The Bayesian AR(1) beats the
+#   classical baseline by 41 MW CRPS (bootstrap CI roughly -57 to -27,
+#   p < 0.001) and the ablation attributes the gain to the
+#   heteroskedastic head: the same model with a constant scale gives 53
+#   of those megawatts back. BART and the Bayesian AR(1) are
+#   statistically tied (3.5 MW, p = 0.63).
+# - LightGBM wins marginal CRPS, and the gap is real (47 MW, p < 0.001).
+#   It is a point-accuracy gap, not an uncertainty gap: median MAE 240
+#   against 311, concentrated beyond five hours of lead time and in the
+#   evening ramp, where boosted trees flex the peak shape in ways a
+#   linear-in-features regression cannot. Within the first two hours the
+#   Bayesian AR(1) is the most accurate model in the field (first
+#   half-hour CRPS near 60 MW against LightGBM's 220), because the AR
+#   carry conditions on the latest observation and decays from there.
+# - What the quantile heads do not provide: a density (no log score),
+#   coherent 48-step paths (no energy score; the Bayesian AR(1) posts
+#   the best in the field) and any decomposition of predictive
+#   uncertainty. For decisions that span the horizon jointly, per-step
+#   quantiles are not a substitute for paths.
+# - Inference choice does not move prediction: mean-field, full-rank and
+#   NUTS forecast within a third of a megawatt of each other. The
+#   differences live in the posterior itself and in what it costs, which
+#   is notebook 04's accounting.

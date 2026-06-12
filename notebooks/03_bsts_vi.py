@@ -175,12 +175,12 @@ hours = (np.arange(cfg.horizon) + 1) / 2
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 axes[0].plot(hours, trend_curve, color=palette("demand"), label="trend BSTS (NUTS)")
-axes[0].plot(hours, arima_curve, color=palette("neutral"), label="ARIMA")
+axes[0].plot(hours, arima_curve, color=palette("forecast"), label="ARIMA")
 axes[0].set_title("CRPS by lead time")
 axes[0].set_ylabel("CRPS (MW)")
 axes[1].plot(hours, trend_sd, color=palette("demand"), label="trend BSTS")
 axes[1].plot(
-    hours, arima_arrays["forecast_sd"].mean(axis=0), color=palette("neutral"), label="ARIMA"
+    hours, arima_arrays["forecast_sd"].mean(axis=0), color=palette("forecast"), label="ARIMA"
 )
 axes[1].set_title("Mean predictive spread by lead time")
 axes[1].set_ylabel("sd (MW)")
@@ -427,7 +427,7 @@ ar_curve = per_horizon_crps(ar_fits["fullrank"][0]["forecast_paths"])
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(hours, trend_curve, color=palette("demand"), ls="--", label="trend BSTS")
 ax.plot(hours, ar_curve, color=palette("demand"), label="AR innovations (full-rank ADVI)")
-ax.plot(hours, arima_curve, color=palette("neutral"), label="ARIMA")
+ax.plot(hours, arima_curve, color=palette("forecast"), label="ARIMA")
 ax.set_xlabel("lead time (hours)")
 ax.set_ylabel("CRPS (MW)")
 ax.set_title("The repair, horizon by horizon")
