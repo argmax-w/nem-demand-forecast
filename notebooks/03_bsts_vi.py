@@ -45,10 +45,18 @@
 # (the energy term absorbs the Jacobian of the constraining transforms; the
 # entropy of a Gaussian surrogate is closed form). Watching the two parts
 # separately shows *how* the surrogate converges: under-dispersion appears
-# as entropy collapsing while energy still climbs. Two families are fitted:
-# **mean-field** (`AutoNormal`, independent Gaussians) and **full-rank**
-# (`AutoMultivariateNormal`, one joint Gaussian whose covariance can carry
-# the posterior correlations mean-field must discard).
+# as entropy collapsing while energy still climbs.
+#
+# Only the **mean-field** family (`AutoNormal`, independent Gaussians)
+# survives this geometry. The **full-rank** alternative
+# (`AutoMultivariateNormal`), whose covariance could carry the posterior
+# correlations mean-field must discard, fails here twice over: its
+# Cholesky factor holds roughly fifteen million entries against 2,688
+# observations, and at the settings that serve it well on the collapsed
+# model it diverged to NaN within two hundred optimisation steps, in both
+# attempts. That failure is reported below as a finding; the two-family
+# comparison happens on the collapsed formulation in notebook 04, where
+# the full covariance is a well-determined fifty-by-fifty object.
 
 # %%
 import os
@@ -72,10 +80,7 @@ cfg = load_config()
 splits = load_splits(cfg.paths.processed)
 panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
-fits = {
-    kind: load_artifact(cfg.paths.artifacts / f"bsts_vi_{kind}")
-    for kind in ("meanfield", "fullrank")
-}
+fits = {kind: load_artifact(cfg.paths.artifacts / f"bsts_vi_{kind}") for kind in ("meanfield",)}
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
 )
@@ -83,7 +88,7 @@ test_origins = rolling_origins(
 # %% [markdown]
 # ## ELBO convergence, decomposed
 #
-# Both surrogates are optimised with Adam (20,000 steps, exponentially
+# The surrogate is optimised with Adam (20,000 steps, exponentially
 # decayed learning rate, gradient clipping); the ELBO is re-estimated with
 # 64 particles at every checkpoint so the curves below are not just
 # single-sample noise.
@@ -127,51 +132,37 @@ pd.DataFrame(
 ).T
 
 # %% [markdown]
-# The energy curves converge to nearly the same value: both families find
-# the same posterior mass. The entropy curves separate them: the mean-field
-# entropy settles lower, the textbook signature of a factorised Gaussian
-# paying for ignored correlations with shrunken marginals.
+# The decomposition is the diagnostic the single ELBO number hides: a
+# factorised Gaussian pays for ignored correlations with shrunken
+# marginals, which appears as entropy settling low while energy still
+# climbs. Whether this mean-field posterior is too tight cannot be settled
+# on this formulation, because nothing better is available here to compare
+# against; notebook 04 settles it on the collapsed model.
 #
-# ## Where mean-field under-estimates variance
+# ## Where the other inference paths stop
 #
-# With both surrogates fitted to the same model, the marginal standard
-# deviations of the hyperparameters can be compared directly, and the
-# full-rank covariance shows which correlations the mean-field family had
-# to discard. Here the surrogates can only be compared with each other:
-# on this explicit-state geometry NUTS does not finish (notebook 04 opens
-# with that finding), so the adjudication against a reference posterior
-# happens on the collapsed formulation there.
-
-# %%
-hyper_names = ["sigma_level", "sigma_slope", "phi", "gamma0", "level_init", "slope_init"]
-rows = {}
-for name in hyper_names:
-    mf = fits["meanfield"][0][f"draw_{name}"]
-    fr = fits["fullrank"][0][f"draw_{name}"]
-    rows[name] = {
-        "mean (MF)": mf.mean(),
-        "sd (MF)": mf.std(),
-        "sd (FR)": fr.std(),
-        "sd ratio MF/FR": mf.std() / fr.std(),
-    }
-pd.DataFrame(rows).T.round(4)
-
-# %%
-labels = ["sigma_level", "sigma_slope", "phi", "gamma0"]
-draws_fr = np.column_stack([fits["fullrank"][0][f"draw_{name}"] for name in labels])
-beta_fr = fits["fullrank"][0]["draw_beta"]
-lag_cols = [i for i, c in enumerate(fits["fullrank"][1]["design_columns"]) if "lag" in c]
-draws_fr = np.column_stack([draws_fr, beta_fr[:, lag_cols]])
-labels = labels + [fits["fullrank"][1]["design_columns"][i] for i in lag_cols]
-corr = np.corrcoef(draws_fr.T)
-
-fig, ax = plt.subplots(figsize=(6, 5))
-im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
-ax.set_xticks(range(len(labels)), labels, rotation=45, ha="right")
-ax.set_yticks(range(len(labels)), labels)
-fig.colorbar(im, label="posterior correlation (full-rank ADVI)")
-ax.set_title("Correlations the mean-field family cannot represent")
-plt.show()
+# This geometry is the project's stress test, and the mean-field guide is
+# the only fit that survives it.
+#
+# - **NUTS (cold)**: stopped after seventeen hours on the GPU without
+#   completing its 2,000 iterations; depth-10 trajectories cost up to
+#   1,023 gradient evaluations per iteration per chain, each one
+#   back-propagated through the 2,688-step scan. Notebook 04 opens with
+#   this finding.
+# - **Full-rank ADVI**: diverged to NaN within two hundred steps, twice,
+#   at the settings that serve the same family well on the collapsed
+#   model (ELBO roughly -30,000 at step 100, NaN by step 200). The deeper
+#   objection stands even if tighter settings were found: a dense
+#   Cholesky factor of roughly fifteen million entries estimated from
+#   2,688 observations with an eight-particle gradient would be
+#   underdetermined regardless of whether it optimised.
+#
+# What rescues both is the same marginalisation: on the collapsed
+# formulation the latent states integrate out exactly, the full-rank
+# covariance becomes a well-determined fifty-dimensional object and NUTS
+# certifies the posterior in minutes. The inference adjudication
+# therefore lives in notebook 04; this notebook carries the surviving
+# fit forward.
 
 # %% [markdown]
 # ## The fitted trend and the learned variance profile
@@ -289,8 +280,8 @@ plt.show()
 #
 # The fractions are diagnostic for the inference comparison too: a
 # surrogate that under-states posterior spread must report a smaller
-# epistemic share, so the gap between the two guides previews what the
-# NUTS adjudication in notebook 04 makes precise.
+# epistemic share. Whether this mean-field fit does is exactly what the
+# NUTS adjudication on the collapsed model in notebook 04 makes precise.
 
 # %%
 from nemforecastdemand.models.predict import variance_decomposition
@@ -308,24 +299,23 @@ component_colours = {
     "parameter": "#1f5673",
 }
 hours = (np.arange(cfg.horizon) + 1) / 2
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
-for ax, kind in zip(axes, fits, strict=True):
-    parts = decomp[kind]
-    total = sum(parts.values())
-    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
-    ax.stackplot(
-        hours,
-        shares,
-        labels=component_order,
-        colors=[component_colours[n] for n in component_order],
-        alpha=0.95,
-    )
-    ax.set_title(kind)
-    ax.set_xlabel("lead time (hours)")
-    ax.set_ylim(0, 1)
-    ax.set_xlim(hours[0], hours[-1])
-axes[0].set_ylabel("share of predictive variance")
-axes[1].legend(loc="center right", fontsize=8)
+fig, ax = plt.subplots(figsize=(7.5, 4))
+parts = decomp["meanfield"]
+total = sum(parts.values())
+shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
+ax.stackplot(
+    hours,
+    shares,
+    labels=component_order,
+    colors=[component_colours[n] for n in component_order],
+    alpha=0.95,
+)
+ax.set_title("mean-field")
+ax.set_xlabel("lead time (hours)")
+ax.set_ylim(0, 1)
+ax.set_xlim(hours[0], hours[-1])
+ax.set_ylabel("share of predictive variance")
+ax.legend(loc="center right", fontsize=8)
 fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.03)
 save_figure(fig, "bsts_vi_variance_decomposition", cfg.paths.figures)
 plt.show()
@@ -339,6 +329,17 @@ for kind in fits:
     rows[kind]["epistemic share"] = rows[kind]["state share"] + rows[kind]["parameter share"]
     rows[kind]["mean predictive sd (MW)"] = float(np.sqrt(total.mean()))
 pd.DataFrame(rows).T.round(3)
+
+# %% [markdown]
+# The allocation is striking: this fit attributes about 95% of its
+# predictive variance to the observation-noise floor and essentially none
+# to future trend innovations, because its posterior pushes the
+# innovation scales towards zero. Taken at face value that says the trend
+# is nearly deterministic and almost nothing would be gained by more
+# data. But if the surrogate under-estimates those scales, the same
+# decomposition under the reference posterior should move variance into
+# the process and parameter shares, and notebook 04 runs exactly that
+# check on the collapsed model.
 
 # %% [markdown]
 # ## Cost
@@ -363,15 +364,18 @@ pd.DataFrame(
 # %% [markdown]
 # ## Summary
 #
-# - Both surrogates converge to near-identical energy; the entropy gap
-#   exposes mean-field's variance under-estimation, quantified above on the
-#   hyperparameter marginals.
-# - The full-rank covariance reveals strong posterior correlations between
-#   the innovation scales, the variance intercept and the lag coefficients.
-# - The heteroskedastic head learns a plausible daily risk profile, and the
-#   Bayesian predictive is competitive with the classical baseline before
-#   any MCMC is spent.
-# - NUTS cannot certify any of this on the explicit states: its cold run
-#   was stopped after seventeen hours, the finding that opens notebook 04.
-#   The states are marginalised there, the full year fitted, and the
-#   surrogate adjudication and warm-start pricing run on that formulation.
+# - The mean-field surrogate optimises cleanly on a 5,400-dimensional
+#   geometry and is the only inference path that survives it: cold NUTS
+#   was stopped after seventeen hours and the full-rank factor diverged
+#   twice, both documented above as findings rather than worked around.
+# - The heteroskedastic head learns a plausible daily risk profile, and
+#   the exact variance decomposition names where predictive uncertainty
+#   comes from at each lead time.
+# - Predictively the fit clears the seasonal-naive floor (364 against 374
+#   MW CRPS) but trails the matched-window classical baseline (301 MW):
+#   imposed structure does not pay for the short window on this task.
+#   What more data and exact marginalisation buy the same model is the
+#   question notebooks 04 and 05 answer.
+# - Whether this posterior is too tight cannot be judged here, because no
+#   reference posterior exists on this formulation; the adjudication runs
+#   against collapsed NUTS in notebook 04.

@@ -13,10 +13,11 @@
 # - **LightGBM quantile regression**: the industry tabular benchmark,
 #   fifteen pinball-objective heads on the same design, trained on the full
 #   training split with a 56-day ablation.
-# - **The explicit-state BSTS, by ADVI**: the structural model of notebook
-#   03, mean-field and full-rank, on its 56-day window. NUTS does not
-#   complete on this formulation (notebook 04 opens with that finding), so
-#   the explicit model fields no sampled posterior here.
+# - **The explicit-state BSTS, by mean-field ADVI**: the structural model
+#   of notebook 03 on its 56-day window. Mean-field is the only inference
+#   that survives this geometry: NUTS does not complete (notebook 04 opens
+#   with that finding) and the full-rank guide diverges, so the explicit
+#   model fields a single row here.
 # - **The collapsed BSTS, three posteriors**: identical structure and
 #   priors with the latent states marginalised through a Kalman filter, so
 #   mean-field, full-rank and NUTS all run over the full training year
@@ -65,7 +66,7 @@ panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 arima_year, arima_year_meta = load_artifact(cfg.paths.artifacts / "arima_year")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
-vi = {k: load_artifact(cfg.paths.artifacts / f"bsts_vi_{k}") for k in ("meanfield", "fullrank")}
+vi = {k: load_artifact(cfg.paths.artifacts / f"bsts_vi_{k}") for k in ("meanfield",)}
 collapsed_nuts, collapsed_nuts_meta = load_artifact(
     cfg.paths.artifacts / "bsts_collapsed_nuts_cold"
 )
@@ -86,7 +87,6 @@ MODELS = [
     "ARIMA (year)",
     "LightGBM",
     "BSTS ADVI mean-field",
-    "BSTS ADVI full-rank",
     "collapsed ADVI mean-field (year)",
     "collapsed ADVI full-rank (year)",
     "collapsed NUTS (year)",
@@ -97,12 +97,11 @@ COLOURS = {
     "ARIMA (year)": "#8a6d3b",
     "LightGBM": "#2e7d32",
     "BSTS ADVI mean-field": palette("demand"),
-    "BSTS ADVI full-rank": palette("accent"),
     "collapsed ADVI mean-field (year)": "#4f9da6",
     "collapsed ADVI full-rank (year)": "#b3589a",
     "collapsed NUTS (year)": palette("temperature"),
 }
-PIT_MODELS = ["ARIMA", "LightGBM", "BSTS ADVI full-rank", "collapsed NUTS (year)"]
+PIT_MODELS = ["ARIMA", "LightGBM", "BSTS ADVI mean-field", "collapsed NUTS (year)"]
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -215,7 +214,6 @@ scores = {
     "ARIMA (year)": gaussian_scores(arima_year["forecast_mean"], arima_year["forecast_sd"]),
     "LightGBM": quantile_scores(gbdt["forecast_quantiles"]),
     "BSTS ADVI mean-field": sample_scores(vi["meanfield"][0]["forecast_paths"]),
-    "BSTS ADVI full-rank": sample_scores(vi["fullrank"][0]["forecast_paths"]),
     "collapsed ADVI mean-field (year)": sample_scores(
         collapsed_vi["meanfield"][0]["forecast_paths"]
     ),
@@ -293,7 +291,6 @@ pairs = [
     ("collapsed NUTS (year)", "ARIMA (year)"),
     ("ARIMA (year)", "ARIMA"),
     ("BSTS ADVI mean-field", "ARIMA"),
-    ("BSTS ADVI full-rank", "BSTS ADVI mean-field"),
     ("collapsed NUTS (year)", "collapsed ADVI mean-field (year)"),
     ("LightGBM", "ARIMA (year)"),
     ("LightGBM", "collapsed NUTS (year)"),
@@ -378,7 +375,6 @@ def sweep_crps(name: str) -> list[float]:
         else:
             paths = {
                 "BSTS ADVI mean-field": vi["meanfield"][0],
-                "BSTS ADVI full-rank": vi["fullrank"][0],
                 "collapsed NUTS (year)": collapsed_nuts,
             }[name][f"{variant}_paths"]
             out.append(
@@ -395,7 +391,7 @@ def sweep_crps(name: str) -> list[float]:
 
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
-for name in ("ARIMA", "LightGBM", "BSTS ADVI full-rank", "collapsed NUTS (year)"):
+for name in ("ARIMA", "LightGBM", "BSTS ADVI mean-field", "collapsed NUTS (year)"):
     values = sweep_crps(name)
     ax.plot(sweep_x, values, marker="o", ms=4, color=COLOURS[name], label=name)
     headline = scores[name]["per_origin_crps"].mean()
@@ -481,10 +477,6 @@ compute_rows = {
     "BSTS ADVI mean-field": {
         "fit (s)": vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
         "forecast all origins (s)": vi["meanfield"][1]["timings_seconds"]["predict_seconds"],
-    },
-    "BSTS ADVI full-rank": {
-        "fit (s)": vi["fullrank"][1]["timings_seconds"]["fit_seconds"],
-        "forecast all origins (s)": vi["fullrank"][1]["timings_seconds"]["predict_seconds"],
     },
     "collapsed ADVI mean-field (year)": {
         "fit (s)": collapsed_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],

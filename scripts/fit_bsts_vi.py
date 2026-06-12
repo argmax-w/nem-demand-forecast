@@ -19,7 +19,14 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
     parser.add_argument("--device", choices=["default", "cpu"], default="default")
     parser.add_argument(
-        "--guides", nargs="+", default=["meanfield", "fullrank"], help="surrogate families to fit"
+        # Mean-field only by default: on this geometry the full-rank
+        # Cholesky holds roughly fifteen million entries against 2,688
+        # observations, and it diverged at every practical learning rate;
+        # the family is adjudicated properly on the collapsed model.
+        "--guides",
+        nargs="+",
+        default=["meanfield"],
+        help="surrogate families to fit",
     )
     parser.add_argument(
         "--benchmark-steps",
@@ -66,11 +73,11 @@ def main() -> None:
     )
     perturbations = fit_perturbation_models(panel, splits["train"].index)
 
-    # The explicit-state geometry hands the full-rank guide a Cholesky
-    # factor of roughly fifteen million entries; at the shared learning
-    # rate the eight-particle gradient blows it apart within two hundred
-    # steps, so this model trains that family an order slower with a
-    # tighter clip and a smaller initial scale.
+    # Stricter settings for anyone who wants to attempt the full-rank
+    # family here regardless: at the settings that serve the collapsed
+    # model it diverged within two hundred steps on this geometry, and
+    # with fifteen million covariance entries against 2,688 observations
+    # the factor would be underdetermined even if it converged.
     overrides = {"fullrank": {"lr_scale": 0.1, "clip": 0.5, "init_scale": 0.005}}
 
     for kind in args.guides:

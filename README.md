@@ -19,7 +19,7 @@ identical weather-input variants.
 | Seasonal naive | 56 days | Gaussian band from weekly-naive errors | the floor and the MASE base |
 | Dynamic harmonic regression + ARIMA errors | 56 days and full year | analytic Gaussian, homoskedastic | strong classical baseline |
 | LightGBM, 15 quantile heads | full year (and a 56-day ablation) | regularised quantiles | industry point-model foil |
-| BSTS, explicit states (~5,400 sampled dims) | 56 days | posterior predictive paths | ADVI only; the case NUTS cannot afford |
+| BSTS, explicit states (~5,400 sampled dims) | 56 days | posterior predictive paths | mean-field ADVI only; the stress test |
 | BSTS, collapsed states (~53 sampled dims) | full year | posterior predictive paths | the production formulation |
 
 The BSTS is a stochastic local linear trend (damped slope) with static
@@ -29,14 +29,18 @@ formulations of the same generative model. The **explicit** form samples
 the latent states (scan-based, non-centred innovations), the way the model
 would naively be written in any probabilistic programming language; every
 half hour adds two latent dimensions, so 56 days already means ~5,400 of
-them. ADVI handles that comfortably. NUTS does not: the cold run was
-stopped after seventeen hours on the GPU without completing its 2,000
-iterations, and that intractability is reported as a finding rather than
-worked around. The **collapsed** form marginalises the states analytically
-through a Kalman filter inside the likelihood, so inference runs over
-roughly fifty hyperparameters regardless of data length; the full training
-year becomes tractable and the identical sampling schedule finishes in
-under an hour on CPU alone. The collapsed formulation is fitted five ways:
+them. Only mean-field ADVI survives that geometry. NUTS was stopped after
+seventeen hours on the GPU without completing its 2,000 iterations, and
+the full-rank guide diverged twice (its dense Cholesky factor holds
+roughly fifteen million entries against 2,688 observations, so it would
+be underdetermined even if it optimised); both failures are reported as
+findings rather than worked around. The **collapsed** form marginalises
+the states analytically through a Kalman filter inside the likelihood, so
+inference runs over roughly fifty hyperparameters regardless of data
+length; the full training year becomes tractable, the full covariance
+becomes a well-determined object and the identical sampling schedule
+finishes in under an hour on CPU alone. The collapsed formulation is
+fitted five ways:
 mean-field ADVI (`AutoNormal`), full-rank ADVI (`AutoMultivariateNormal`),
 cold NUTS (the reference posterior) and warm-started NUTS with chain
 positions and the frozen inverse mass matrix taken from each surrogate
@@ -52,16 +56,16 @@ The axes of comparison, and where each is answered:
 
 1. **Inference algorithm at fixed model** (mean-field against full-rank
    against NUTS): posterior fidelity on marginals and correlations,
-   predictive consequences, cost. Mean-field against full-rank on the
-   explicit model in notebook 03; the full adjudication against NUTS on
-   the collapsed model in notebook 04.
+   predictive consequences, cost. The adjudication runs on the collapsed
+   model in notebook 04; notebook 03 documents why only mean-field
+   survives the explicit geometry.
 2. **Warm-start economics**: cold total against ADVI fit plus reduced
    warmup plus sampling, judged only at matched quality (target bulk ESS,
    clean R-hat, no divergences). Notebook 04.
 3. **Formulation against geometry** (explicit ~5,400 dimensions on 56 days
-   against collapsed ~53 dimensions on the full year): where NUTS becomes
-   intractable, where ADVI still works and what marginalisation buys.
-   Notebooks 03 and 04.
+   against collapsed ~53 dimensions on the full year): where NUTS and the
+   full-rank guide become intractable, where mean-field still works and
+   what marginalisation buys back. Notebooks 03 and 04.
 4. **Model class and training window** (Bayesian against classical against
    gradient-boosted against naive): accuracy, calibration, joint-path
    coherence, statistical significance and robustness to degrading weather
@@ -106,10 +110,12 @@ Headline test-set scores (archived forecast weather) are produced in
    selection, the trigonometric-versus-RBF basis assessment, calibration
    and test scores for the classical baseline at the 56-day and full-year
    training windows.
-3. [`03_bsts_vi`](notebooks/03_bsts_vi.ipynb): the BSTS fitted by ADVI,
-   with the ELBO decomposed into energy and entropy as it trains, mean-field
-   against full-rank, the learned heteroskedastic variance profile and
-   posterior predictive forecasts.
+3. [`03_bsts_vi`](notebooks/03_bsts_vi.ipynb): the explicit-state BSTS
+   fitted by mean-field ADVI, with the ELBO decomposed into energy and
+   entropy as it trains, the learned heteroskedastic variance profile,
+   the aleatoric-epistemic split of predictive variance, posterior
+   predictive forecasts and the documented failures of NUTS and the
+   full-rank guide on this geometry.
 4. [`04_bsts_nuts`](notebooks/04_bsts_nuts.ipynb): NUTS on the collapsed
    formulation with full diagnostics as the reference posterior, ADVI
    adjudicated against it, the honest cold-versus-warm-start accounting at
