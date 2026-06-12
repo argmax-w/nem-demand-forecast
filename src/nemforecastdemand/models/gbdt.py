@@ -1,11 +1,13 @@
 """Gradient-boosted quantile forecaster: the industry point-model foil.
 
-LightGBM regressors on the shared design matrix, one head per quantile
-level, trained with the pinball objective and early stopping on the
-validation split. Trees handle the interactions the linear models leave on
-the table (temperature by hour, irradiance by season), which makes this the
-strongest "just predict the number" benchmark available for tabular load
-data.
+LightGBM regressors on the shared design matrix plus the origin-anchored
+recency features, one head per quantile level, trained with the pinball
+objective and early stopping on the validation split. Trees handle the
+interactions the linear models leave on the table (temperature by hour,
+irradiance by season), and the recency columns hand them the same
+information the time-series models carry through their AR error dynamics,
+which makes this the strongest "just predict the number" benchmark
+available for tabular load data.
 
 Honesty notes, also surfaced in notebook 05. The set of quantile heads is
 not a generative model: paths cannot be sampled, so the energy score is
@@ -23,7 +25,13 @@ import pandas as pd
 from lightgbm import LGBMRegressor, early_stopping
 
 from nemforecastdemand.config import Config
-from nemforecastdemand.models.base import Forecast, Forecaster, build_design
+from nemforecastdemand.models.base import (
+    Forecast,
+    Forecaster,
+    build_design,
+    recency_features,
+    stacked_origin_design,
+)
 from nemforecastdemand.splits import horizon_index
 
 #: Quantile heads. The 0.025/0.975 pair closes the 95% central interval,
@@ -74,31 +82,31 @@ class LightGbmQuantile(Forecaster):
     def fit(
         self,
         panel: pd.DataFrame,
-        fit_index: pd.DatetimeIndex,
-        validation_index: pd.DatetimeIndex | None = None,
+        train_origins: pd.DatetimeIndex,
+        validation_origins: pd.DatetimeIndex | None = None,
     ) -> LightGbmQuantile:
         """Fit every quantile head, early stopping on a validation window.
+
+        Training rows are origin blocks rather than raw timestamps, so the
+        heads see the origin-anchored recency features under exactly the
+        distribution they will receive at forecast time.
 
         Parameters
         ----------
         panel
             Full processed panel.
-        fit_index
-            Training rows (rows inside the demand-lag warmup are dropped).
-        validation_index
-            Rows used for early stopping. When omitted, every head runs to
-            the configured estimator cap.
+        train_origins
+            Forecast origins whose 48-step blocks form the training rows.
+        validation_origins
+            Origins whose blocks drive early stopping. When omitted, every
+            head runs to the configured estimator cap.
         """
-        design = build_design(panel, self.cfg, weather_source="actual")
-        y = panel["demand_mw"].astype(np.float64)
-
-        train_design = design.loc[fit_index].dropna()
-        train_y = y.loc[train_design.index]
+        train_design, train_y = stacked_origin_design(panel, self.cfg, train_origins)
         eval_kwargs = {}
-        if validation_index is not None:
-            val_design = design.loc[validation_index]
+        if validation_origins is not None:
+            val_design, val_y = stacked_origin_design(panel, self.cfg, validation_origins)
             eval_kwargs = {
-                "eval_set": [(val_design, y.loc[validation_index])],
+                "eval_set": [(val_design, val_y)],
                 "callbacks": [early_stopping(50, verbose=False)],
             }
 
@@ -124,7 +132,9 @@ class LightGbmQuantile(Forecaster):
             raise RuntimeError("fit the model first")
         index = horizon_index(origin, self.cfg.horizon)
         design = build_design(panel, self.cfg, weather_source=weather_source, overrides=overrides)
-        block = design.loc[index]
+        block = pd.concat(
+            [design.loc[index], recency_features(panel, origin, self.cfg.horizon)], axis=1
+        )
         raw = np.stack([self._heads[level].predict(block) for level in self.quantiles])
         # Independent heads can cross; sorting per step restores a valid
         # quantile function without changing any single head's calibration.

@@ -113,6 +113,53 @@ def build_design(
     return pd.concat(blocks, axis=1).astype(np.float64)
 
 
+def recency_features(panel: pd.DataFrame, origin: pd.Timestamp, horizon: int) -> pd.DataFrame:
+    """Origin-anchored features carrying the AR(1) information set to trees.
+
+    The time-series models condition on the residual at the forecast origin
+    through their error dynamics; a direct regression sees one row per
+    target time and cannot. These three columns close that gap: how far the
+    last observed half hour sits above its day-ago and week-ago values, and
+    how many steps ahead the target is, from which trees can learn a
+    decaying correction. Everything is computed strictly before the origin.
+    """
+    index = horizon_index(origin, horizon)
+    demand = panel["demand_mw"]
+    last = origin - pd.Timedelta("30min")
+    step = pd.Timedelta("30min")
+    return pd.DataFrame(
+        {
+            "horizon_step": np.arange(horizon, dtype=np.float64),
+            "dev_day": float(demand.loc[last] - demand.loc[last - 48 * step]),
+            "dev_week": float(demand.loc[last] - demand.loc[last - 336 * step]),
+        },
+        index=index,
+    )
+
+
+def stacked_origin_design(
+    panel: pd.DataFrame,
+    cfg: Config,
+    origins: pd.DatetimeIndex,
+    weather_source: str = "actual",
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Training rows for direct regressors, one 48-step block per origin.
+
+    Each block is the shared design over the origin's horizon plus the
+    origin-anchored recency columns, so training mirrors the operational
+    setting exactly: timestamps covered by both daily origins appear twice
+    with different recency values, once per issue time.
+    """
+    design = build_design(panel, cfg, weather_source=weather_source)
+    blocks, targets = [], []
+    for origin in origins:
+        index = horizon_index(origin, cfg.horizon)
+        block = pd.concat([design.loc[index], recency_features(panel, origin, cfg.horizon)], axis=1)
+        blocks.append(block)
+        targets.append(panel["demand_mw"].loc[index])
+    return pd.concat(blocks), pd.concat(targets).astype(np.float64)
+
+
 def variance_design(
     panel: pd.DataFrame, cfg: Config, weather_source: str = "actual"
 ) -> pd.DataFrame:

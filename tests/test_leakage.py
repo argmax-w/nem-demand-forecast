@@ -14,7 +14,12 @@ from tests.conftest import MARKET_TZ, make_panel
 
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_splits
-from nemforecastdemand.models.base import build_design, variance_design
+from nemforecastdemand.models.base import (
+    build_design,
+    recency_features,
+    stacked_origin_design,
+    variance_design,
+)
 from nemforecastdemand.models.bsts import prepare_inputs
 from nemforecastdemand.splits import horizon_index
 
@@ -96,6 +101,31 @@ def test_horizon_lag_features_predate_the_origin(cfg):
         assert (sources < origin).all()
         expected = panel["demand_mw"].reindex(sources).to_numpy(dtype=np.float64)
         np.testing.assert_array_equal(design[f"demand_lag{lag}"].to_numpy(), expected)
+
+
+def test_recency_features_anchor_strictly_before_the_origin(cfg):
+    # The deviations are differences of observed demand at fixed offsets
+    # behind the origin, constant across the block; the horizon step is
+    # calendar metadata.
+    panel = make_panel("2025-06-01", days=28)
+    origin = panel.index[20 * 48]
+    block = recency_features(panel, origin, cfg.horizon)
+    demand = panel["demand_mw"]
+    np.testing.assert_array_equal(block["horizon_step"], np.arange(cfg.horizon))
+    assert block["dev_day"].nunique() == 1
+    expected = float(demand.iloc[20 * 48 - 1] - demand.iloc[20 * 48 - 49])
+    np.testing.assert_allclose(block["dev_day"].iloc[0], expected, rtol=1e-6)
+
+    # Corrupting demand from the origin onwards must leave the whole
+    # origin block untouched: recency features and every demand lag look
+    # strictly backwards, so only the targets may change.
+    corrupted = panel.copy()
+    corrupted.loc[panel.index >= origin, "demand_mw"] += 10_000.0
+    origins = pd.DatetimeIndex([origin])
+    clean_x, clean_y = stacked_origin_design(panel, cfg, origins)
+    dirty_x, dirty_y = stacked_origin_design(corrupted, cfg, origins)
+    pd.testing.assert_frame_equal(clean_x, dirty_x)
+    assert (dirty_y - clean_y).abs().max() > 1_000.0
 
 
 def test_bsts_scalers_ignore_data_after_the_fit_window(cfg):
