@@ -39,7 +39,7 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
     parser.add_argument("--tune", type=int, default=None, help="override warmup iterations")
     parser.add_argument("--draws", type=int, default=None, help="override posterior draws")
-    parser.add_argument("--keep-draws", type=int, default=500, help="thinned predictive draws")
+    parser.add_argument("--keep-draws", type=int, default=1000, help="thinned predictive draws")
     args = parser.parse_args()
 
     import pymc as pm
@@ -101,9 +101,10 @@ def main() -> None:
         f"mu max R-hat (sampled rows) {sigma_summary['mu_max_rhat_sampled']:.4f}"
     )
 
-    total = bart.chains * draws
-    step = max(total // args.keep_draws, 1)
-    thinned = idata.sel(draw=slice(None, None, max(step // bart.chains, 1)))
+    # Thinning is per chain: a step of (chains * draws / keep) leaves
+    # keep / chains draws in each chain, keep in total.
+    step = max(bart.chains * draws // args.keep_draws, 1)
+    thinned = idata.sel(draw=slice(None, None, step))
 
     def predict_rows(design_block: np.ndarray, seed_offset: int) -> np.ndarray:
         """Posterior predictive draws on new rows, trees re-evaluated."""

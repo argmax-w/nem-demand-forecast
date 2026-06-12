@@ -11,6 +11,10 @@
 #   baseline, analytic Gaussian predictive.
 # - **LightGBM quantile regression**: the industry tabular benchmark,
 #   fifteen pinball-objective heads on the same design.
+# - **BART**: Bayesian additive regression trees on the same design, the
+#   Bayesian counterpart to LightGBM. Trees are discrete, so neither ADVI
+#   nor NUTS applies; it is fitted by its native particle-Gibbs sampler
+#   and contributes full posterior predictive draws.
 # - **The BSTS, three posteriors**: the structural model of notebooks 03
 #   and 04, latent states marginalised through a Kalman filter, fitted by
 #   mean-field ADVI, full-rank ADVI and NUTS. Same model, same priors,
@@ -61,6 +65,7 @@ panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
+bart, bart_meta = load_artifact(cfg.paths.artifacts / "bart")
 collapsed_nuts, collapsed_nuts_meta = load_artifact(
     cfg.paths.artifacts / "bsts_collapsed_nuts_cold"
 )
@@ -79,6 +84,7 @@ MODELS = [
     "seasonal naive",
     "ARIMA",
     "LightGBM",
+    "BART",
     "BSTS ADVI mean-field",
     "BSTS ADVI full-rank",
     "BSTS NUTS",
@@ -87,11 +93,12 @@ COLOURS = {
     "seasonal naive": "#9a9a9a",
     "ARIMA": palette("forecast"),
     "LightGBM": "#2e7d32",
+    "BART": "#7a4988",
     "BSTS ADVI mean-field": palette("demand"),
     "BSTS ADVI full-rank": palette("accent"),
     "BSTS NUTS": "black",
 }
-PIT_MODELS = ["ARIMA", "LightGBM", "BSTS ADVI mean-field", "BSTS NUTS"]
+PIT_MODELS = ["ARIMA", "LightGBM", "BART", "BSTS NUTS"]
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -202,6 +209,7 @@ scores = {
     "seasonal naive": gaussian_scores(arima["naive_mean"], arima["naive_sd"]),
     "ARIMA": gaussian_scores(arima["forecast_mean"], arima["forecast_sd"]),
     "LightGBM": quantile_scores(gbdt["forecast_quantiles"]),
+    "BART": sample_scores(bart["forecast_paths"]),
     "BSTS ADVI mean-field": sample_scores(collapsed_vi["meanfield"][0]["forecast_paths"]),
     "BSTS ADVI full-rank": sample_scores(collapsed_vi["fullrank"][0]["forecast_paths"]),
     "BSTS NUTS": sample_scores(collapsed_nuts["forecast_paths"]),
@@ -244,6 +252,8 @@ pairs = [
     ("BSTS NUTS", "ARIMA"),
     ("BSTS NUTS", "LightGBM"),
     ("LightGBM", "ARIMA"),
+    ("BART", "LightGBM"),
+    ("BSTS NUTS", "BART"),
     ("BSTS ADVI mean-field", "BSTS NUTS"),
     ("BSTS ADVI full-rank", "BSTS NUTS"),
     ("ARIMA", "seasonal naive"),
@@ -325,6 +335,7 @@ def sweep_crps(name: str) -> list[float]:
             )
         else:
             paths = {
+                "BART": bart,
                 "BSTS ADVI mean-field": collapsed_vi["meanfield"][0],
                 "BSTS NUTS": collapsed_nuts,
             }[name][f"{variant}_paths"]
@@ -342,7 +353,7 @@ def sweep_crps(name: str) -> list[float]:
 
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
-for name in ("ARIMA", "LightGBM", "BSTS NUTS"):
+for name in ("ARIMA", "LightGBM", "BART", "BSTS NUTS"):
     values = sweep_crps(name)
     ax.plot(sweep_x, values, marker="o", ms=4, color=COLOURS[name], label=name)
     headline = scores[name]["per_origin_crps"].mean()
@@ -418,6 +429,10 @@ compute_rows = {
     "LightGBM": {
         "fit (s)": gbdt_meta["timings_seconds"]["fit"],
         "forecast all origins (s)": gbdt_meta["timings_seconds"]["test_forecasts"],
+    },
+    "BART": {
+        "fit (s)": bart_meta["timings_seconds"]["fit_seconds"],
+        "forecast all origins (s)": bart_meta["timings_seconds"]["predict_seconds"],
     },
     "BSTS ADVI mean-field": {
         "fit (s)": collapsed_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
