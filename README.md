@@ -77,8 +77,12 @@ The axes of comparison, and where each is answered:
   issued one day earlier (Open-Meteo previous-runs API), so the headline
   evaluation has no look-ahead. Temperature, dew point, direct and diffuse
   irradiance.
-- **Splits:** chronological 70/15/15; validation selects the ARIMA order
-  and seasonal basis; the test set is touched only by the final evaluation.
+- **Splits:** chronological 70/15/15, cut at market-day boundaries;
+  validation selects the ARIMA order and seasonal basis; the test set is
+  touched only by the final evaluation. The range is representative: train
+  and test each straddle a Sydney daylight-saving transition (the seasonal
+  basis runs on the local clock), every split contains public holidays, and
+  test demand stays inside the range seen in training.
 - **Weather-input variants:** archived forecast (headline), ERA5 perfect
   foresight (disclosed upper bound) and a calibrated perturbation sweep
   fitted to measured forecast-minus-ERA5 errors.
@@ -143,7 +147,11 @@ notebooks report measured speed-ups.
 
 `pytest` covers the scoring rules (the sample-based CRPS is verified
 against the analytic Gaussian form), feature engineering, split integrity
-and loader schemas. `ruff` handles lint and formatting; CI runs both plus
+and loader schemas, plus a leakage audit: every design row is invariant to
+deletion of the future, standardisation statistics come from the fit
+window only, the shortest demand lag clears the 48-step horizon, and the
+committed splits are checked for unbroken chronology and the
+representativeness properties above. `ruff` handles lint and formatting; CI runs both plus
 the tests on every push.
 
 ## Data licences and attribution
