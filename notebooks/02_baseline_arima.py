@@ -36,7 +36,7 @@ import pandas as pd
 from scipy import stats
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.calibration import pit_gaussian, pit_histogram
 from nemforecastdemand.evaluation.metrics import (
     crps_gaussian,
@@ -57,8 +57,8 @@ from nemforecastdemand.utils import load_artifact
 
 setup_style()
 cfg = load_config()
+panel = load_panel(cfg.paths.processed)
 splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 arrays, meta = load_artifact(cfg.paths.artifacts / "arima")
 
 test_origins = rolling_origins(

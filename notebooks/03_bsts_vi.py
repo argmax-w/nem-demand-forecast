@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_gaussian, crps_samples
 from nemforecastdemand.models import bsts
 from nemforecastdemand.models.predict import (
@@ -84,8 +84,8 @@ from nemforecastdemand.utils import load_artifact
 
 setup_style()
 cfg = load_config()
+panel = load_panel(cfg.paths.processed)
 splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 max_lag = max(cfg.features.demand_lags)
 
 trend_fits = {
@@ -100,7 +100,7 @@ trend_nuts, trend_nuts_meta = load_artifact(cfg.paths.artifacts / "bsts_collapse
 arima_arrays, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 
 test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
-fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+fit_index = splits["train"].index[max_lag:]
 inputs = bsts.prepare_inputs(panel, cfg, fit_index)
 y_test = trend_fits["meanfield"][0]["y_test"]
 colours = {"meanfield": palette("demand"), "fullrank": palette("accent")}

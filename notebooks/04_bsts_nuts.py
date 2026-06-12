@@ -118,14 +118,14 @@ from functools import partial
 import jax.numpy as jnp
 from numpyro.infer.util import log_density
 
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.models import bsts, innovations
 from nemforecastdemand.splits import rolling_origins
 
+panel = load_panel(cfg.paths.processed)
 splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 max_lag = max(cfg.features.demand_lags)
-fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+fit_index = splits["train"].index[max_lag:]
 inputs = bsts.prepare_inputs(panel, cfg, fit_index)
 test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
 model_args = (

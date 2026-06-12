@@ -2,9 +2,10 @@
 # # 05. Model comparison
 #
 # **Goal.** Score every model on identical test origins (two per day,
-# 00:00 and 12:00 AEST, eight weeks) with identical features and weather
-# variants, and answer three questions: who forecasts best, whose
-# uncertainty is honest and what each result costs to compute.
+# 00:00 and 12:00 AEST, spread across all twelve months of the evaluation
+# year) with identical features and weather variants, and answer three
+# questions: who forecasts best, whose uncertainty is honest and what each
+# result costs to compute.
 #
 # The field:
 #
@@ -37,7 +38,7 @@ import pandas as pd
 from scipy import stats
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.calibration import pit_gaussian, pit_histogram, pit_samples
 from nemforecastdemand.evaluation.diagnostics import time_to_target_ess
 from nemforecastdemand.evaluation.metrics import (
@@ -57,8 +58,8 @@ from nemforecastdemand.utils import load_artifact
 
 setup_style()
 cfg = load_config()
+panel = load_panel(cfg.paths.processed)
 splits = load_splits(cfg.paths.processed)
-panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")

@@ -16,16 +16,20 @@
 # %% [markdown]
 # # 01. Exploratory analysis and data cleansing
 #
-# This notebook examines the raw inputs, verifies that timestamps and joins
-# are exactly right, justifies the cleansing decisions and writes the
-# processed train, validation and test splits consumed by every model
-# notebook. `scripts/build_dataset.py` mirrors the build steps headlessly.
+# **Goal.** Examine the raw inputs, verify the timestamps and joins are
+# exactly right, justify the cleansing, detect the non-linear structure the
+# models will need, and write the committed panel and the season-blocked
+# split labels every later notebook consumes. `scripts/build_dataset.py`
+# mirrors these steps headlessly.
 #
-# The data are NSW1 operational demand actuals from NEMWeb (half-hourly),
-# ERA5 reanalysis weather and archived ECMWF IFS day-ahead forecasts from
-# Open-Meteo (hourly, interpolated onto the half-hourly grid). Everything is
-# stored and modelled in UTC with period-start timestamps; plots are shown in
-# AEST, the NEM market time. Weather data by
+# The data are NSW1 demand from AEMO's aggregated price-and-demand archive
+# (`TOTALDEMAND`, five-minute dispatch averaged to half hours), three years
+# from May 2023, paired with ERA5 reanalysis weather and archived ECMWF IFS
+# day-ahead forecasts from Open-Meteo (hourly, interpolated onto the
+# half-hourly grid). The longer demand history is deliberate: it is what
+# lets the evaluation split cover every season in both validation and test.
+# Everything is stored and modelled in UTC with period-start timestamps;
+# plots are shown in AEST, the NEM market time. Weather data by
 # [Open-Meteo](https://open-meteo.com/) (CC BY 4.0).
 
 # %%
@@ -36,7 +40,7 @@ import polars as pl
 
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data import weather
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import MARKET_TZ, load_splits
 from nemforecastdemand.features.calendar import holiday_flag
 from nemforecastdemand.features.preprocessing import build_panel, half_hourly_grid
 from nemforecastdemand.plotting import (
@@ -49,7 +53,7 @@ from nemforecastdemand.plotting import (
     save_figure,
     setup_style,
 )
-from nemforecastdemand.splits import chronological_split, split_summary
+from nemforecastdemand.splits import season_blocked_split, split_labels, split_summary
 
 setup_style()
 cfg = load_config()
@@ -208,11 +212,11 @@ print(
 #
 # ## What drives NSW1 demand
 #
-# The window covers a full year plus a repeated autumn, so both seasons'
-# behaviour is visible. Demand carries a strong daily cycle, a weekly cycle
-# from working patterns, a U-shaped temperature response (heating below
-# roughly 17 C, cooling above roughly 20 C) and midday suppression from
-# rooftop solar.
+# The window covers three years, so every season recurs and the
+# year-on-year trend is visible. Demand carries a strong daily cycle, a
+# weekly cycle from working patterns, a U-shaped temperature response
+# (heating below roughly 17 C, cooling above roughly 20 C) and midday
+# suppression from rooftop solar.
 
 # %%
 daily_mean = demand.resample("1D").mean()
@@ -365,21 +369,71 @@ report.as_frame()
 # because reruns over future windows inherit them, and the zero counts are
 # themselves evidence the upstream feeds are curated.
 #
-# ## Chronological splits
+# ## Season-blocked splits
 #
-# Roughly 70/15/15 by whole market days, no shuffling: train teaches the
-# models, validation selects the ARIMA order and seasonal basis and test is
-# touched only by the final rolling-origin evaluation. The splits are written
-# as parquet and committed, so every later notebook starts from identical,
-# schema-validated data.
+# A single year of demand cannot support an honest seasonal evaluation: a
+# plain chronological cut puts one season in validation and a different one
+# in test, so any choice tuned on validation is judged out of season. With
+# three years of history the design instead keeps everything before June
+# 2025 as one contiguous training block and carves the final year into
+# monthly pairs of five-day windows, sending one window of each month to
+# validation and the other to test. Both evaluation sets then span all
+# twelve months, so selection on validation faces the same seasonal mix as
+# the test set.
+#
+# Two properties make this leakage-clean. The training block ends before
+# every evaluation window, so no fitting target sits behind an evaluation
+# point and no lagged feature of a training row can read one. And the
+# validation/test slot is drawn by a balanced seed, half early-window and
+# half late-window for each set, so neither is biased to the start or end
+# of the month. The committed panel and split labels are schema-validated,
+# so every later notebook starts from identical data.
 
 # %%
-splits = chronological_split(panel.index, cfg.splits.train, cfg.splits.validation)
+splits = season_blocked_split(panel.index, cfg.splits)
+labels = split_labels(panel.index, splits)
 cfg.paths.processed.mkdir(parents=True, exist_ok=True)
-for name, index in splits.items():
-    panel.loc[index].to_parquet(cfg.paths.processed / f"{name}.parquet")
+panel.to_parquet(cfg.paths.processed / "panel.parquet")
+pd.DataFrame({"split": labels}).to_parquet(cfg.paths.processed / "split_labels.parquet")
 load_splits(cfg.paths.processed)
 split_summary(splits)
+
+# %% [markdown]
+# Both evaluation sets cover every month, and each takes the early window
+# in half of them and the late window in the other half. The map below
+# reads off the leakage guarantee at a glance: the training block (left) is
+# one solid span, and the validation and test windows interleave only after
+# it ends.
+
+# %%
+month_market = panel.index.tz_convert(LOCAL_TZ)
+assignment = pd.DataFrame(
+    {
+        "month": pd.PeriodIndex(labels.index.tz_convert(MARKET_TZ), freq="M").astype(str),
+        "split": labels.to_numpy(),
+        "day": labels.index.tz_convert(MARKET_TZ).day,
+    }
+)
+eval_assignment = assignment[assignment["split"].isin(["validation", "test"])]
+slot = eval_assignment.assign(
+    window=lambda d: np.where(d["day"] <= 12, "early", "late")
+).pivot_table(index="month", columns="split", values="window", aggfunc="first")
+print(slot.to_string())
+
+fig, ax = plt.subplots(figsize=(11, 2.2))
+colours = {"train": "#1f5673", "validation": "#e8a13a", "test": "#c44536", "none": "#eeeeee"}
+for name, colour in colours.items():
+    mask = labels.to_numpy() == name
+    if mask.any():
+        ax.fill_between(
+            display_index(labels.index), 0, mask.astype(float), step="mid", color=colour, label=name
+        )
+ax.set_yticks([])
+ax.set_title("Two-year training block, then interleaved all-season evaluation windows")
+ax.legend(loc="upper left", ncol=4, fontsize=8)
+format_date_axis(ax)
+save_figure(fig, "split_map", cfg.paths.figures)
+plt.show()
 
 # %% [markdown]
 # ## Trigonometric or radial seasonal basis?
