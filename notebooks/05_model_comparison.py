@@ -19,7 +19,9 @@
 # - **Bayesian AR(1)**: the repaired model of notebooks 03 and 04, fitted
 #   by mean-field ADVI, full-rank ADVI and warm-started NUTS (the
 #   reference posterior), plus a homoskedastic ablation that prices the
-#   variance head.
+#   variance head and a variant with a learned GP interaction surface
+#   over time of day and temperature in place of guessing further
+#   hand-made columns.
 #
 # Scores: CRPS (primary), log score, pinball, MAE, MASE, central coverage,
 # PIT and the energy score over whole 48-step paths. Representation
@@ -69,6 +71,10 @@ ar_vi = {
     k: load_artifact(cfg.paths.artifacts / f"bsts_innovations_vi_{k}")
     for k in ("meanfield", "fullrank")
 }
+hsgp_stem = cfg.paths.artifacts / "bsts_hsgp_nuts_reference"
+hsgp, hsgp_meta = (
+    load_artifact(hsgp_stem) if hsgp_stem.with_suffix(".npz").exists() else (None, None)
+)
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
 )
@@ -97,6 +103,9 @@ COLOURS = {
     "Bayesian AR(1) NUTS": "black",
 }
 PIT_MODELS = ["ARIMA", "LightGBM", "BART", "Bayesian AR(1) NUTS"]
+if hsgp is not None:
+    MODELS.append("Bayesian AR(1) + GP surface")
+    COLOURS["Bayesian AR(1) + GP surface"] = "#c44536"
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -213,6 +222,8 @@ scores = {
     "Bayesian AR(1) FR-ADVI": sample_scores(ar_vi["fullrank"][0]["forecast_paths"]),
     "Bayesian AR(1) NUTS": sample_scores(ar_nuts["forecast_paths"]),
 }
+if hsgp is not None:
+    scores["Bayesian AR(1) + GP surface"] = sample_scores(hsgp["forecast_paths"])
 
 # %% [markdown]
 # ## The master table
@@ -258,6 +269,11 @@ pairs = [
     ("Bayesian AR(1) MF-ADVI", "Bayesian AR(1) NUTS"),
     ("ARIMA", "seasonal naive"),
 ]
+if hsgp is not None:
+    pairs += [
+        ("Bayesian AR(1) + GP surface", "Bayesian AR(1) NUTS"),
+        ("Bayesian AR(1) + GP surface", "LightGBM"),
+    ]
 sig_rows = {}
 for a, b in pairs:
     result = paired_bootstrap_difference(
@@ -459,6 +475,14 @@ compute_rows = {
         ),
     },
 }
+if hsgp is not None:
+    compute_rows["Bayesian AR(1) + GP surface"] = {
+        "fit (s)": hsgp_meta["advi_seconds"]
+        + hsgp_meta["timings_seconds"]["warmup_seconds"]
+        + hsgp_meta["timings_seconds"]["sample_seconds"],
+        "forecast all origins (s)": hsgp_meta["timings_seconds"]["predict_seconds"],
+        "min bulk ESS": hsgp_meta["min_bulk_ess"],
+    }
 compute = pd.DataFrame(compute_rows).T
 compute.round(1)
 

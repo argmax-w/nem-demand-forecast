@@ -99,6 +99,13 @@ def prepare_inputs(panel: pd.DataFrame, cfg: Config, fit_index: pd.DatetimeIndex
     y_loc, y_scale = float(y.mean()), float(y.std())
     x_loc = design.mean().to_numpy()
     x_scale = design.std().replace(0.0, 1.0).to_numpy()
+    # The GP basis columns carry kernel structure in their prior scales,
+    # which per-column standardisation would distort; they are bounded
+    # by construction, so they pass through unscaled.
+    is_gp = np.array([column.startswith("gp_") for column in design.columns])
+    if is_gp.any():
+        x_loc = np.where(is_gp, 0.0, x_loc)
+        x_scale = np.where(is_gp, 1.0, x_scale)
     xv_loc = vdesign.mean().to_numpy()
     xv_scale = vdesign.std().replace(0.0, 1.0).to_numpy()
 

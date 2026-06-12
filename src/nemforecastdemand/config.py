@@ -75,6 +75,14 @@ class FeatureConfig:
     # letting the temperature response and the weekend profile vary by
     # time of day. Zero disables the block.
     interaction_harmonics: int = 0
+    # Basis-function Gaussian process surface over time of day and
+    # temperature: a truncated spectral basis whose weight priors carry
+    # kernel structure in the model. Zero in either disables the block;
+    # only the HSGP variant of the Bayesian model enables it.
+    hsgp_time_harmonics: int = 0
+    hsgp_temp_basis: int = 0
+    hsgp_temp_lo: float = -5.0
+    hsgp_temp_hi: float = 45.0
 
 
 @dataclass(frozen=True)

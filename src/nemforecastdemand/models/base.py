@@ -130,6 +130,10 @@ def build_design(
             interactions[f"heating_{column}"] = degrees["heating_deg"] * basis[column]
             interactions[f"weekend_{column}"] = weekend * basis[column]
         blocks.append(pd.DataFrame(interactions, index=panel.index))
+    if cfg.features.hsgp_time_harmonics > 0 and cfg.features.hsgp_temp_basis > 0:
+        from nemforecastdemand.models.hsgp import gp_design
+
+        blocks.append(gp_design(panel.index, weather["temp_c"], cfg.features))
     return pd.concat(blocks, axis=1).astype(np.float64)
 
 
