@@ -1,12 +1,16 @@
-"""Fit the collapsed BSTS on the full training year and write artifacts.
+"""Fit the collapsed trend BSTS and write artifacts.
 
 The collapsed model marginalises the latent states through a Kalman filter,
 so ADVI (mean-field and full-rank) and NUTS (cold and ADVI-warm-started)
-work in a roughly fifty-dimensional hyperparameter space over all available
-training history, rather than the 5,400-dimensional explicit-state space
-over its 56-day window. Settings deliberately match the explicit fits, so
-the two formulations differ only in marginalisation and data window. The
-trade is visible in the timings: cheap dimensions, expensive gradients.
+work in a roughly fifty-dimensional hyperparameter space over the whole
+training block rather than a state space that grows with the data. The trade
+is a sequential filter inside every gradient, which is hostile to the GPU.
+
+The default run is on the CPU: the scan parallelises across cores by chain
+and, on this stack, is the only device where the sampler compiles at all.
+``--device gpu`` reruns the same fits on the GPU purely for the timing
+comparison and writes ``{stem}.gpu.json`` sidecars; any fit the GPU backend
+cannot compile is recorded as a failure rather than aborting the benchmark.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import os
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
-    parser.add_argument("--device", choices=["default", "cpu"], default="default")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
     args = parser.parse_args()
 
     from dataclasses import replace
@@ -27,8 +31,8 @@ def main() -> None:
     from nemforecastdemand.config import load_config
 
     cfg = load_config(args.config)
-    sidecar_only = args.device == "cpu"
-    if sidecar_only:
+    benchmark = args.device == "gpu"
+    if not benchmark:
         # The collapsed likelihood is a sequential scan, so vectorised
         # chains run in lockstep on one or two cores. One XLA host device
         # per chain lets the chains run in parallel across the package's
@@ -62,7 +66,6 @@ def main() -> None:
     splits = load_splits(cfg.paths.processed)
     max_lag = max(cfg.features.demand_lags)
 
-    # Full available history up to the test boundary, less the lag warmup.
     fit_index = splits["train"].index[max_lag:]
     inputs = bsts.prepare_inputs(panel, cfg, fit_index)
     model_fn = partial(
@@ -87,16 +90,28 @@ def main() -> None:
         return full
 
     def save(stem: str, arrays: dict, meta: dict) -> None:
-        # The CPU pass is a timing benchmark: metadata sidecars only, so
-        # the GPU artifacts and their predictions stay in place.
-        if sidecar_only:
-            path = cfg.paths.artifacts / f"{stem}.cpu.json"
-            path.write_text(json.dumps(meta, indent=2, default=str))
+        if benchmark:
+            (cfg.paths.artifacts / f"{stem}.gpu.json").write_text(
+                json.dumps(meta, indent=2, default=str)
+            )
         else:
             save_artifact(cfg.paths.artifacts / stem, arrays, meta)
 
+    def attempt(stem: str, thunk):
+        """Run a fit; in benchmark mode record a GPU compile failure and skip."""
+        if not benchmark:
+            return thunk()
+        try:
+            return thunk()
+        except Exception as exc:
+            (cfg.paths.artifacts / f"{stem}.gpu.json").write_text(
+                json.dumps({"gpu_compile_failed": str(exc)[:300]}, indent=2)
+            )
+            print(f"{stem}: GPU benchmark failed to compile ({type(exc).__name__})", flush=True)
+            return None
+
     def predict_and_pack(draws: dict[str, np.ndarray], timings: dict[str, float]) -> dict:
-        if sidecar_only:
+        if benchmark:
             return {}
         with timed("predict_seconds", timings):
             variants, y_true = predict_variants(
@@ -127,16 +142,22 @@ def main() -> None:
 
     vi_fits = {}
     for kind in ("meanfield", "fullrank"):
-        fit = fit_advi(model_fn, kind, cfg.vi, seed=cfg.seed)
+        fit = attempt(
+            f"bsts_collapsed_vi_{kind}",
+            lambda kind=kind: fit_advi(model_fn, kind, cfg.vi, seed=cfg.seed),
+        )
+        if fit is None:
+            continue
         vi_fits[kind] = fit
         print(
             f"collapsed {kind} on {fit.device}: {fit.timings['fit_seconds']:.0f}s, "
-            f"final ELBO {fit.trace.elbo[-1]:.0f}"
+            f"final ELBO {fit.trace.elbo[-1]:.0f}",
+            flush=True,
         )
         draws = fit.posterior_draws(model_fn, seed=cfg.seed + 10, n_draws=cfg.vi.posterior_draws)
         timings = dict(fit.timings)
         arrays = predict_and_pack(draws, timings)
-        if not sidecar_only:
+        if not benchmark:
             arrays.update(
                 {
                     "elbo_steps": fit.trace.steps,
@@ -160,34 +181,44 @@ def main() -> None:
             },
         )
 
-    run = fit_nuts(model_fn, cfg.nuts, seed=cfg.seed)
-    print(
-        f"collapsed cold on {run.device}: warmup {run.timings['warmup_seconds']:.0f}s, "
-        f"sampling {run.timings['sample_seconds']:.0f}s, "
-        f"max rhat {run.summary()['max_rhat'].max():.4f}"
-    )
-    draws = flatten_chains(run.posterior)
-    keep = max(draws["sigma_level"].shape[0] // cfg.vi.posterior_draws, 1)
-    thinned = {name: draws[name][::keep] for name in sites}
-    timings = dict(run.timings)
-    arrays = predict_and_pack(thinned, timings)
-    if not sidecar_only:
-        for name in sites:
-            arrays[f"post_{name}"] = run.posterior[name]
-        for name, value in run.extra.items():
-            arrays[f"extra_{name}"] = np.asarray(value)
-    save(
-        "bsts_collapsed_nuts_cold",
-        arrays,
-        run_meta(run, {"predict_seconds": timings.get("predict_seconds")}),
-    )
+    run = attempt("bsts_collapsed_nuts_cold", lambda: fit_nuts(model_fn, cfg.nuts, seed=cfg.seed))
+    if run is not None:
+        print(
+            f"collapsed cold on {run.device}: warmup {run.timings['warmup_seconds']:.0f}s, "
+            f"sampling {run.timings['sample_seconds']:.0f}s, "
+            f"max rhat {run.summary()['max_rhat'].max():.4f}",
+            flush=True,
+        )
+        draws = flatten_chains(run.posterior)
+        keep = max(draws["sigma_level"].shape[0] // cfg.vi.posterior_draws, 1)
+        thinned = {name: draws[name][::keep] for name in sites}
+        timings = dict(run.timings)
+        arrays = predict_and_pack(thinned, timings)
+        if not benchmark:
+            for name in sites:
+                arrays[f"post_{name}"] = run.posterior[name]
+            for name, value in run.extra.items():
+                arrays[f"extra_{name}"] = np.asarray(value)
+        save(
+            "bsts_collapsed_nuts_cold",
+            arrays,
+            run_meta(run, {"predict_seconds": timings.get("predict_seconds")}),
+        )
 
     for kind in ("meanfield", "fullrank"):
+        if kind not in vi_fits:
+            continue
         warm = warm_start_from_vi(vi_fits[kind], cfg.nuts.chains, seed=cfg.seed + 20)
         for reduced in cfg.warm_start.reduced_warmup:
-            run = fit_nuts(
-                model_fn, cfg.nuts, seed=cfg.seed + reduced, warmup=reduced, warm_start=warm
+            stem = f"bsts_collapsed_nuts_warm_{kind}_w{reduced}"
+            run = attempt(
+                stem,
+                lambda reduced=reduced, warm=warm: fit_nuts(
+                    model_fn, cfg.nuts, seed=cfg.seed + reduced, warmup=reduced, warm_start=warm
+                ),
             )
+            if run is None:
+                continue
             meta = run_meta(
                 run,
                 {
@@ -197,16 +228,17 @@ def main() -> None:
                 },
             )
             arrays = {}
-            if not sidecar_only:
+            if not benchmark:
                 arrays = {f"post_{name}": run.posterior[name] for name in sites}
                 for name, value in run.extra.items():
                     arrays[f"extra_{name}"] = np.asarray(value)
-            save(f"bsts_collapsed_nuts_warm_{kind}_w{reduced}", arrays, meta)
+            save(stem, arrays, meta)
             print(
                 f"collapsed warm {kind} w{reduced}: "
                 f"warmup {run.timings['warmup_seconds']:.0f}s, "
                 f"sampling {run.timings['sample_seconds']:.0f}s, "
-                f"max rhat {meta['max_rhat']:.4f}, divergences {meta['total_divergences']}"
+                f"max rhat {meta['max_rhat']:.4f}, divergences {meta['total_divergences']}",
+                flush=True,
             )
 
 
