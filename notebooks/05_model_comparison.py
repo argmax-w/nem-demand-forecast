@@ -1,5 +1,5 @@
 # %% [markdown]
-# # 05. Model comparison: model classes, training windows and inference
+# # 05. Model comparison: model classes and inference strategies
 #
 # Headline results. Four model families forecast NSW1 operational demand
 # on identical test origins (two per day, 00:00 and 12:00 AEST, across
@@ -8,20 +8,16 @@
 # - **Seasonal naive**: same half hour last week, with an honest Gaussian
 #   band. The floor every model must clear.
 # - **Dynamic harmonic regression with ARIMA errors**: the classical
-#   baseline, analytic Gaussian predictive, fitted on a recent 56-day
-#   window and again on the full training year.
+#   baseline, analytic Gaussian predictive.
 # - **LightGBM quantile regression**: the industry tabular benchmark,
-#   fifteen pinball-objective heads on the same design, trained on the full
-#   training split with a 56-day ablation.
-# - **The explicit-state BSTS, by mean-field ADVI**: the structural model
-#   of notebook 03 on its 56-day window. Mean-field is the only inference
-#   that survives this geometry: NUTS does not complete (notebook 04 opens
-#   with that finding) and the full-rank guide diverges, so the explicit
-#   model fields a single row here.
-# - **The collapsed BSTS, three posteriors**: identical structure and
-#   priors with the latent states marginalised through a Kalman filter, so
-#   mean-field, full-rank and NUTS all run over the full training year
-#   (notebook 04 develops the formulation and certifies its posterior).
+#   fifteen pinball-objective heads on the same design.
+# - **The BSTS, three posteriors**: the structural model of notebooks 03
+#   and 04, latent states marginalised through a Kalman filter, fitted by
+#   mean-field ADVI, full-rank ADVI and NUTS. Same model, same priors,
+#   same data; the inference algorithm is the only difference.
+#
+# Every model trains on the same chronological split and sees the full
+# history before the test boundary.
 #
 # Scores: CRPS (primary), log score, pinball loss, MAE, MASE, central
 # coverage, PIT calibration and the energy score over whole 48-step paths.
@@ -64,9 +60,7 @@ splits = load_splits(cfg.paths.processed)
 panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
-arima_year, arima_year_meta = load_artifact(cfg.paths.artifacts / "arima_year")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
-vi = {k: load_artifact(cfg.paths.artifacts / f"bsts_vi_{k}") for k in ("meanfield",)}
 collapsed_nuts, collapsed_nuts_meta = load_artifact(
     cfg.paths.artifacts / "bsts_collapsed_nuts_cold"
 )
@@ -84,24 +78,20 @@ gbdt_levels = np.array(gbdt_meta["quantile_levels"])
 MODELS = [
     "seasonal naive",
     "ARIMA",
-    "ARIMA (year)",
     "LightGBM",
     "BSTS ADVI mean-field",
-    "collapsed ADVI mean-field (year)",
-    "collapsed ADVI full-rank (year)",
-    "collapsed NUTS (year)",
+    "BSTS ADVI full-rank",
+    "BSTS NUTS",
 ]
 COLOURS = {
     "seasonal naive": "#9a9a9a",
     "ARIMA": palette("forecast"),
-    "ARIMA (year)": "#8a6d3b",
     "LightGBM": "#2e7d32",
     "BSTS ADVI mean-field": palette("demand"),
-    "collapsed ADVI mean-field (year)": "#4f9da6",
-    "collapsed ADVI full-rank (year)": "#b3589a",
-    "collapsed NUTS (year)": palette("temperature"),
+    "BSTS ADVI full-rank": palette("accent"),
+    "BSTS NUTS": "black",
 }
-PIT_MODELS = ["ARIMA", "LightGBM", "BSTS ADVI mean-field", "collapsed NUTS (year)"]
+PIT_MODELS = ["ARIMA", "LightGBM", "BSTS ADVI mean-field", "BSTS NUTS"]
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -211,14 +201,10 @@ def quantile_scores(quantile_paths: np.ndarray) -> dict:
 scores = {
     "seasonal naive": gaussian_scores(arima["naive_mean"], arima["naive_sd"]),
     "ARIMA": gaussian_scores(arima["forecast_mean"], arima["forecast_sd"]),
-    "ARIMA (year)": gaussian_scores(arima_year["forecast_mean"], arima_year["forecast_sd"]),
     "LightGBM": quantile_scores(gbdt["forecast_quantiles"]),
-    "BSTS ADVI mean-field": sample_scores(vi["meanfield"][0]["forecast_paths"]),
-    "collapsed ADVI mean-field (year)": sample_scores(
-        collapsed_vi["meanfield"][0]["forecast_paths"]
-    ),
-    "collapsed ADVI full-rank (year)": sample_scores(collapsed_vi["fullrank"][0]["forecast_paths"]),
-    "collapsed NUTS (year)": sample_scores(collapsed_nuts["forecast_paths"]),
+    "BSTS ADVI mean-field": sample_scores(collapsed_vi["meanfield"][0]["forecast_paths"]),
+    "BSTS ADVI full-rank": sample_scores(collapsed_vi["fullrank"][0]["forecast_paths"]),
+    "BSTS NUTS": sample_scores(collapsed_nuts["forecast_paths"]),
 }
 
 # %% [markdown]
@@ -248,38 +234,6 @@ master = pd.DataFrame(table).T
 master.round(2)
 
 # %% [markdown]
-# How much of each model's position is the training window rather than the
-# model class? Three of the families exist at both windows: LightGBM has
-# its 56-day ablation, ARIMA its full-year refit, and the BSTS pair changes
-# formulation along with the window (the explicit form cannot afford the
-# year, which is notebook 04's opening finding, so its 56-day ADVI fit
-# stands against the collapsed full-year posterior):
-
-# %%
-pd.Series(
-    {
-        "LightGBM, full training year": gbdt_meta["headline_test_crps_mw"],
-        f"LightGBM, {gbdt_meta['window_ablation_days']}-day window": gbdt_meta[
-            "window_ablation_crps_mw"
-        ],
-        "ARIMA, full training year": float(scores["ARIMA (year)"]["per_origin_crps"].mean()),
-        "ARIMA, 56-day window": float(scores["ARIMA"]["per_origin_crps"].mean()),
-        "BSTS collapsed NUTS, full training year": float(
-            scores["collapsed NUTS (year)"]["per_origin_crps"].mean()
-        ),
-        "BSTS explicit ADVI mean-field, 56-day window": float(
-            scores["BSTS ADVI mean-field"]["per_origin_crps"].mean()
-        ),
-    },
-    name="test CRPS (MW)",
-).to_frame().round(1)
-
-# %% [markdown]
-# The pairings separate data quantity from model class: how much each
-# family gains from the year is read down each pair, and how the classes
-# rank at a fixed window is read across. The narrative beneath these
-# numbers is written against the executed table.
-#
 # ## Are the differences real?
 #
 # Paired block bootstrap over origins on per-origin CRPS (10,000 resamples).
@@ -287,13 +241,11 @@ pd.Series(
 
 # %%
 pairs = [
-    ("collapsed NUTS (year)", "ARIMA"),
-    ("collapsed NUTS (year)", "ARIMA (year)"),
-    ("ARIMA (year)", "ARIMA"),
-    ("BSTS ADVI mean-field", "ARIMA"),
-    ("collapsed NUTS (year)", "collapsed ADVI mean-field (year)"),
-    ("LightGBM", "ARIMA (year)"),
-    ("LightGBM", "collapsed NUTS (year)"),
+    ("BSTS NUTS", "ARIMA"),
+    ("BSTS NUTS", "LightGBM"),
+    ("LightGBM", "ARIMA"),
+    ("BSTS ADVI mean-field", "BSTS NUTS"),
+    ("BSTS ADVI full-rank", "BSTS NUTS"),
     ("ARIMA", "seasonal naive"),
 ]
 sig_rows = {}
@@ -326,8 +278,8 @@ plt.show()
 # %%
 fig, ax = plt.subplots(figsize=(8.5, 4.5))
 for name in MODELS:
-    if name in ("collapsed ADVI mean-field (year)", "collapsed ADVI full-rank (year)"):
-        continue  # nearly coincident with collapsed NUTS; the table carries them
+    if name in ("BSTS ADVI mean-field", "BSTS ADVI full-rank"):
+        continue  # nearly coincident with the NUTS posterior; the table carries them
     horizon_curve(ax, scores[name]["per_step_crps"], name, COLOURS[name])
 ax.set_ylabel("CRPS (MW)")
 ax.set_title("CRPS by lead time, archived forecast weather")
@@ -353,11 +305,10 @@ def sweep_crps(name: str) -> list[float]:
     out = []
     for m in sweep_x:
         variant = "actual" if m == 0 else f"perturb_{m:g}"
-        if name in ("ARIMA", "ARIMA (year)"):
-            source = arima if name == "ARIMA" else arima_year
+        if name == "ARIMA":
             out.append(
                 float(
-                    crps_gaussian(y_test, source[f"{variant}_mean"], source[f"{variant}_sd"]).mean()
+                    crps_gaussian(y_test, arima[f"{variant}_mean"], arima[f"{variant}_sd"]).mean()
                 )
             )
         elif name == "LightGBM":
@@ -374,8 +325,8 @@ def sweep_crps(name: str) -> list[float]:
             )
         else:
             paths = {
-                "BSTS ADVI mean-field": vi["meanfield"][0],
-                "collapsed NUTS (year)": collapsed_nuts,
+                "BSTS ADVI mean-field": collapsed_vi["meanfield"][0],
+                "BSTS NUTS": collapsed_nuts,
             }[name][f"{variant}_paths"]
             out.append(
                 float(
@@ -391,7 +342,7 @@ def sweep_crps(name: str) -> list[float]:
 
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
-for name in ("ARIMA", "LightGBM", "BSTS ADVI mean-field", "collapsed NUTS (year)"):
+for name in ("ARIMA", "LightGBM", "BSTS NUTS"):
     values = sweep_crps(name)
     ax.plot(sweep_x, values, marker="o", ms=4, color=COLOURS[name], label=name)
     headline = scores[name]["per_origin_crps"].mean()
@@ -407,7 +358,7 @@ plt.show()
 # ## Case study: the hardest day in the test set
 
 # %%
-consensus = scores["collapsed NUTS (year)"]["per_origin_crps"] + scores["ARIMA"]["per_origin_crps"]
+consensus = scores["BSTS NUTS"]["per_origin_crps"] + scores["ARIMA"]["per_origin_crps"]
 worst = int(consensus.argmax())
 origin = test_origins[worst]
 index = pd.date_range(origin, periods=cfg.horizon, freq="30min")
@@ -425,8 +376,8 @@ fan_chart(
     axes[1],
     index,
     samples=collapsed_nuts["forecast_paths"][:, worst, :],
-    colour=COLOURS["collapsed NUTS (year)"],
-    label="collapsed NUTS (year)",
+    colour=COLOURS["BSTS NUTS"],
+    label="BSTS NUTS",
 )
 for ax in axes:
     ax.plot(
@@ -438,9 +389,7 @@ for ax in axes:
     )
     ax.set_ylabel("demand (MW)")
 axes[0].set_title(f"ARIMA, CRPS {scores['ARIMA']['per_origin_crps'][worst]:.0f} MW")
-axes[1].set_title(
-    f"collapsed NUTS, CRPS {scores['collapsed NUTS (year)']['per_origin_crps'][worst]:.0f} MW"
-)
+axes[1].set_title(f"BSTS NUTS, CRPS {scores['BSTS NUTS']['per_origin_crps'][worst]:.0f} MW")
 axes[0].legend()
 fig.suptitle(
     f"Worst common origin: {origin.tz_convert('Australia/Brisbane'):%A %d %B %Y %H:%M} AEST", y=1.04
@@ -466,25 +415,23 @@ compute_rows = {
         "fit (s)": arima_meta["timings_seconds"]["final_fit"],
         "forecast all origins (s)": arima_meta["timings_seconds"]["test_forecasts"],
     },
-    "ARIMA (year)": {
-        "fit (s)": arima_year_meta["timings_seconds"]["final_fit_year"],
-        "forecast all origins (s)": arima_year_meta["timings_seconds"]["test_forecasts_year"],
-    },
     "LightGBM": {
         "fit (s)": gbdt_meta["timings_seconds"]["fit"],
         "forecast all origins (s)": gbdt_meta["timings_seconds"]["test_forecasts"],
     },
     "BSTS ADVI mean-field": {
-        "fit (s)": vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
-        "forecast all origins (s)": vi["meanfield"][1]["timings_seconds"]["predict_seconds"],
-    },
-    "collapsed ADVI mean-field (year)": {
         "fit (s)": collapsed_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
         "forecast all origins (s)": collapsed_vi["meanfield"][1]["timings_seconds"][
             "predict_seconds"
         ],
     },
-    "collapsed NUTS (year)": {
+    "BSTS ADVI full-rank": {
+        "fit (s)": collapsed_vi["fullrank"][1]["timings_seconds"]["fit_seconds"],
+        "forecast all origins (s)": collapsed_vi["fullrank"][1]["timings_seconds"][
+            "predict_seconds"
+        ],
+    },
+    "BSTS NUTS": {
         "fit (s)": collapsed_nuts_meta["timings_seconds"]["warmup_seconds"]
         + collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
         "forecast all origins (s)": collapsed_nuts_meta["predict_seconds"],

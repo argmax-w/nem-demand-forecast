@@ -20,7 +20,6 @@ N_HIST = 200
 @pytest.fixture(scope="module")
 def cfg_bsts() -> BstsConfig:
     return BstsConfig(
-        train_days=4,
         damped_slope=True,
         obs_family="gaussian",
         heteroskedastic=True,

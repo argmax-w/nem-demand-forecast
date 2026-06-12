@@ -2,9 +2,9 @@
 
 Order selection on the validation set, a seasonal-basis assessment
 (trigonometric against periodic RBF) at the chosen order, a final refit on
-the window ending at the test boundary and rolling-origin test forecasts
-under every weather-input variant. Heavy steps land in ``artifacts/`` so the
-notebooks only read results.
+the full history before the test boundary and rolling-origin test
+forecasts under every weather-input variant. Heavy steps land in
+``artifacts/`` so the notebooks only read results.
 """
 
 from __future__ import annotations
@@ -49,10 +49,12 @@ def main() -> None:
     splits = load_splits(cfg.paths.processed)
     panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
-    window = cfg.arima.train_days * 48
 
-    train_fit = splits["train"].index[-window:]
-    final_fit = panel.index[panel.index < splits["test"].index[0]][-window:]
+    # Selection trains on the full training split and scores on validation;
+    # the final fit then uses everything before the test boundary. The lag
+    # warmup is trimmed so the design has no missing demand lags.
+    train_fit = splits["train"].index[max_lag:]
+    final_fit = panel.index[panel.index < splits["test"].index[0]][max_lag:]
     val_origins = rolling_origins(
         splits["validation"].index, panel.index, cfg.origins, cfg.horizon, max_lag
     )
@@ -166,44 +168,6 @@ def main() -> None:
     }
     save_artifact(cfg.paths.artifacts / "arima", arrays, meta)
     print(f"chosen order {chosen} with {chosen_basis} basis; artifacts written")
-
-    # Full-year refit at the same specification. The order and basis stay as
-    # selected above, so when this fit meets the full-year models in notebook
-    # 05 the comparison isolates the training window from the model class.
-    timings_year: dict[str, float] = {}
-    year_fit = panel.index[panel.index < splits["test"].index[0]][max_lag:]
-    print(f"year fit: {len(year_fit)} half hours from {year_fit[0]} to {year_fit[-1]}", flush=True)
-    with timed("final_fit_year", timings_year):
-        model_year = DynamicHarmonicRegression(cfg, chosen).fit(panel, year_fit)
-    with timed("test_forecasts_year", timings_year):
-        variants_year = run_variants(
-            model_year,
-            panel,
-            test_origins,
-            perturbations,
-            cfg.perturbation.sweep_multipliers,
-            cfg.seed,
-        )
-
-    arrays_year = {
-        "origins_test": test_origins.asi8,
-        "y_test": np.stack(
-            [panel["demand_mw"].loc[fc.index].to_numpy() for fc in variants_year["forecast"]]
-        ).astype(np.float32),
-    }
-    for name, forecasts in variants_year.items():
-        arrays_year[f"{name}_mean"] = stack(forecasts, "mean")
-        arrays_year[f"{name}_sd"] = stack(forecasts, "sd")
-    meta_year = {
-        "chosen_order": list(chosen),
-        "chosen_basis": chosen_basis,
-        "timings_seconds": timings_year,
-        "n_exog": len(model_year.results.model.exog_names),
-        "n_obs": len(year_fit),
-        "fit_window": [str(year_fit[0]), str(year_fit[-1])],
-    }
-    save_artifact(cfg.paths.artifacts / "arima_year", arrays_year, meta_year)
-    print("year artifacts written")
 
 
 if __name__ == "__main__":

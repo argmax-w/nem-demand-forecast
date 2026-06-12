@@ -1,10 +1,24 @@
+# ---
+# jupyter:
+#   jupytext:
+#     cell_metadata_filter: -all
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.3
+#   kernelspec:
+#     display_name: Python (nem-demand-forecast)
+#     language: python
+#     name: nem-demand-forecast
+# ---
+
 # %% [markdown]
 # # 03. The Bayesian structural time-series model, fitted by ADVI
 #
 # The generative model is defined once in `nemforecastdemand.models.bsts`
-# and shared with notebook 04, which marginalises its latent states and
-# fits it by NUTS on the full training year, so everything that differs
-# between these notebooks is the inference strategy. On demand
+# and shared with notebook 04, which fits it by NUTS; everything that
+# differs between these notebooks is the inference algorithm. On demand
 # standardised over the fitting window:
 #
 # $$
@@ -28,11 +42,21 @@
 # Gaussians on the variance head, whose exponential link punishes loose
 # priors with pathological geometry.
 #
-# **Parameterisation matters more than priors here.** The innovations enter
-# as standard normal draws scaled inside the `lax.scan` recursion (the
-# non-centred form), which removes the funnel coupling the innovation scales
-# to the states. Sampled state paths plus roughly fifty regression and
-# variance parameters give a latent space of about 5,400 dimensions.
+# **The states are marginalised, not sampled.** Conditional on the
+# hyperparameters the trend is linear-Gaussian, so a Kalman filter inside
+# the likelihood integrates the state path out exactly and inference works
+# over roughly fifty hyperparameters however long the data. The naive
+# alternative, sampling every half hour's innovations as latent draws,
+# costs two dimensions per half hour, caps the affordable window at a few
+# weeks and defeats most of the toolkit; when it was attempted here, cold
+# NUTS did not complete 2,000 iterations in seventeen hours on the GPU and
+# the full-rank guide diverged, a dense Cholesky over thousands of
+# dimensions being underdetermined at any setting. Marginalisation removes
+# the dimension problem at the price of a sequential filter inside every
+# gradient, and the full training year is affordable for every inference
+# path. The same filter drives prediction: forecasts condition on all
+# demand up to each origin and simulate forward, with no per-origin
+# refitting.
 #
 # **ADVI.** Automatic-differentiation variational inference maximises the
 # evidence lower bound over a Gaussian surrogate $q$ in the unconstrained
@@ -45,18 +69,12 @@
 # (the energy term absorbs the Jacobian of the constraining transforms; the
 # entropy of a Gaussian surrogate is closed form). Watching the two parts
 # separately shows *how* the surrogate converges: under-dispersion appears
-# as entropy collapsing while energy still climbs.
-#
-# Only the **mean-field** family (`AutoNormal`, independent Gaussians)
-# survives this geometry. The **full-rank** alternative
-# (`AutoMultivariateNormal`), whose covariance could carry the posterior
-# correlations mean-field must discard, fails here twice over: its
-# Cholesky factor holds roughly fifteen million entries against 2,688
-# observations, and at the settings that serve it well on the collapsed
-# model it diverged to NaN within two hundred optimisation steps, in both
-# attempts. That failure is reported below as a finding; the two-family
-# comparison happens on the collapsed formulation in notebook 04, where
-# the full covariance is a well-determined fifty-by-fifty object.
+# as entropy collapsing while energy still climbs. Two families are
+# fitted: **mean-field** (`AutoNormal`, independent Gaussians) and
+# **full-rank** (`AutoMultivariateNormal`, one joint Gaussian whose
+# covariance can carry the posterior correlations mean-field must
+# discard). At fifty-odd dimensions the full covariance is a
+# well-determined object.
 
 # %%
 import os
@@ -71,6 +89,7 @@ from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_splits
 from nemforecastdemand.evaluation.metrics import crps_gaussian, crps_samples
 from nemforecastdemand.models import bsts
+from nemforecastdemand.models.predict import variance_decomposition
 from nemforecastdemand.plotting import fan_chart, palette, save_figure, setup_style
 from nemforecastdemand.splits import rolling_origins
 from nemforecastdemand.utils import load_artifact
@@ -79,16 +98,31 @@ setup_style()
 cfg = load_config()
 splits = load_splits(cfg.paths.processed)
 panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
+max_lag = max(cfg.features.demand_lags)
 
-fits = {kind: load_artifact(cfg.paths.artifacts / f"bsts_vi_{kind}") for kind in ("meanfield",)}
-test_origins = rolling_origins(
-    splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
-)
+fits = {
+    kind: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{kind}")
+    for kind in ("meanfield", "fullrank")
+}
+test_origins = rolling_origins(splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag)
+fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+inputs = bsts.prepare_inputs(panel, cfg, fit_index)
+
+SITES = tuple(s for s in bsts.HYPER_SITES if s not in ("level_init", "slope_init"))
+
+
+def draws_of(kind: str) -> dict[str, np.ndarray]:
+    """Hyperparameter draws with the marginalised init sites at their prior mean."""
+    arrays = fits[kind][0]
+    draws = {site: arrays[f"draw_{site}"] for site in SITES}
+    zeros = np.zeros(draws["sigma_level"].shape[0], dtype=np.float32)
+    return {**draws, "level_init": zeros, "slope_init": zeros}
+
 
 # %% [markdown]
 # ## ELBO convergence, decomposed
 #
-# The surrogate is optimised with Adam (20,000 steps, exponentially
+# Both surrogates are optimised with Adam (20,000 steps, exponentially
 # decayed learning rate, gradient clipping); the ELBO is re-estimated with
 # 64 particles at every checkpoint so the curves below are not just
 # single-sample noise.
@@ -110,6 +144,7 @@ save_figure(fig, "elbo_decomposition", cfg.paths.figures)
 plt.show()
 
 
+# %%
 def plateau_drift(elbo: np.ndarray, window: int = 20) -> str:
     """Relative ELBO drift between the last two checkpoint windows."""
     recent = elbo[-window:].mean()
@@ -121,7 +156,7 @@ pd.DataFrame(
     {
         kind: {
             "final ELBO": meta["final_elbo"],
-            "final entropy": meta["final_entropy"],
+            "final entropy": float(arrays["entropy"][-1]),
             "plateau drift, last 2k steps": plateau_drift(arrays["elbo"]),
             "fit seconds": meta["timings_seconds"]["fit_seconds"],
             "steps per second": meta["timings_seconds"]["steps_per_second"],
@@ -132,66 +167,85 @@ pd.DataFrame(
 ).T
 
 # %% [markdown]
-# The decomposition is the diagnostic the single ELBO number hides: a
-# factorised Gaussian pays for ignored correlations with shrunken
-# marginals, which appears as entropy settling low while energy still
-# climbs. Whether this mean-field posterior is too tight cannot be settled
-# on this formulation, because nothing better is available here to compare
-# against; notebook 04 settles it on the collapsed model.
+# The energy curves show whether both families find the same posterior
+# mass; the entropy curves are where a factorised Gaussian pays for the
+# correlations it discards, settling lower than a family that can carry
+# them. The decomposition makes that visible during training rather than
+# after the fact.
 #
-# ## Where the other inference paths stop
+# ## Where mean-field under-estimates variance
 #
-# This geometry is the project's stress test, and the mean-field guide is
-# the only fit that survives it.
-#
-# - **NUTS (cold)**: stopped after seventeen hours on the GPU without
-#   completing its 2,000 iterations; depth-10 trajectories cost up to
-#   1,023 gradient evaluations per iteration per chain, each one
-#   back-propagated through the 2,688-step scan. Notebook 04 opens with
-#   this finding.
-# - **Full-rank ADVI**: diverged to NaN within two hundred steps, twice,
-#   at the settings that serve the same family well on the collapsed
-#   model (ELBO roughly -30,000 at step 100, NaN by step 200). The deeper
-#   objection stands even if tighter settings were found: a dense
-#   Cholesky factor of roughly fifteen million entries estimated from
-#   2,688 observations with an eight-particle gradient would be
-#   underdetermined regardless of whether it optimised.
-#
-# What rescues both is the same marginalisation: on the collapsed
-# formulation the latent states integrate out exactly, the full-rank
-# covariance becomes a well-determined fifty-dimensional object and NUTS
-# certifies the posterior in minutes. The inference adjudication
-# therefore lives in notebook 04; this notebook carries the surviving
-# fit forward.
-
-# %% [markdown]
-# ## The fitted trend and the learned variance profile
-#
-# The level component absorbs what the regression cannot explain: slow
-# drift in the demand baseline. The variance head learns the daily rhythm
-# of predictability, narrow bands in the small hours and wide bands across
-# the afternoon and evening, which is exactly what the homoskedastic
-# baseline could not express.
+# With both surrogates fitted to the same model, the marginal standard
+# deviations of the hyperparameters compare directly, and the full-rank
+# covariance shows which correlations the mean-field family had to
+# discard. Which family is closer to the truth is settled by the NUTS
+# reference posterior in notebook 04.
 
 # %%
-fit_index = panel.index[panel.index < splits["test"].index[0]][-cfg.bsts.train_days * 48 :]
-inputs = bsts.prepare_inputs(panel, cfg, fit_index)
+hyper_names = ["sigma_level", "sigma_slope", "phi", "gamma0"]
+rows = {}
+for name in hyper_names:
+    mf = fits["meanfield"][0][f"draw_{name}"]
+    fr = fits["fullrank"][0][f"draw_{name}"]
+    rows[name] = {
+        "mean (MF)": mf.mean(),
+        "sd (MF)": mf.std(),
+        "sd (FR)": fr.std(),
+        "sd ratio MF/FR": mf.std() / fr.std(),
+    }
+pd.DataFrame(rows).T.round(4)
+
+# %%
+labels = ["sigma_level", "sigma_slope", "phi", "gamma0"]
+draws_fr = np.column_stack([fits["fullrank"][0][f"draw_{name}"] for name in labels])
+beta_fr = fits["fullrank"][0]["draw_beta"]
+lag_cols = [i for i, c in enumerate(inputs.columns) if "lag" in c]
+draws_fr = np.column_stack([draws_fr, beta_fr[:, lag_cols]])
+labels = labels + [inputs.columns[i] for i in lag_cols]
+corr = np.corrcoef(draws_fr.T)
+
+fig, ax = plt.subplots(figsize=(6, 5))
+im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(labels)), labels, rotation=45, ha="right")
+ax.set_yticks(range(len(labels)), labels)
+fig.colorbar(im, label="posterior correlation (full-rank ADVI)")
+ax.set_title("Correlations the mean-field family cannot represent")
+plt.show()
+
+# %% [markdown]
+# ## The filtered trend and the learned variance profile
+#
+# The level component absorbs what the regression cannot explain: slow
+# drift in the demand baseline across the year. The variance head learns
+# the daily rhythm of predictability, narrow bands in the small hours and
+# wide bands across the afternoon and evening, which is exactly what the
+# homoskedastic baseline could not express.
+
+# %%
+filtered_mean, _ = bsts.kalman_filter_states(
+    draws_of("meanfield"), inputs.y, inputs.x_mean, inputs.x_var, cfg.bsts
+)
+level_mw = filtered_mean[:, :, 0] * inputs.y_scale + inputs.y_loc
+times = fit_index.tz_convert("Australia/Brisbane")
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for kind, (arrays, _meta) in fits.items():
-    level_mw = arrays["level_mean"] * inputs.y_scale + inputs.y_loc
-    band_lo = arrays["level_q05"] * inputs.y_scale + inputs.y_loc
-    band_hi = arrays["level_q95"] * inputs.y_scale + inputs.y_loc
-    times = fit_index.tz_convert("Australia/Brisbane")
-    axes[0].plot(times, level_mw, color=colours[kind], lw=1.2, label=kind)
-    axes[0].fill_between(times, band_lo, band_hi, color=colours[kind], alpha=0.2)
-axes[0].set_title("Posterior of the trend level")
+axes[0].fill_between(
+    times,
+    np.quantile(level_mw, 0.05, axis=0),
+    np.quantile(level_mw, 0.95, axis=0),
+    color=palette("demand"),
+    alpha=0.25,
+    label="90% band over draws",
+)
+axes[0].plot(times, level_mw.mean(axis=0), color=palette("demand"), lw=0.9, label="mean")
+axes[0].set_title("Filtered trend level, mean-field draws")
 axes[0].set_ylabel("MW")
 axes[0].legend()
 
 local_hour = fit_index.tz_convert("Australia/Sydney")
 hour_frac = local_hour.hour + local_hour.minute / 60
-for kind, (arrays, _meta) in fits.items():
+for kind in fits:
+    arrays = fits[kind][0]
     gamma0 = arrays["draw_gamma0"][:, None]
     gamma = arrays["draw_gamma"]
     log_sigma = gamma0 + gamma @ inputs.x_var.T
@@ -204,6 +258,7 @@ axes[1].set_title("Learned observation scale by local hour")
 axes[1].set_xlabel("local Sydney hour")
 axes[1].set_ylabel("sigma (MW)")
 axes[1].set_xticks(np.arange(0, 25, 3))
+axes[1].legend()
 fig.tight_layout()
 save_figure(fig, "bsts_trend_and_variance", cfg.paths.figures)
 plt.show()
@@ -231,7 +286,7 @@ for kind, (arrays, _meta) in fits.items():
         ]
     )
     crps_rows[f"BSTS ADVI {kind}"] = per_origin.mean()
-crps_rows["ARIMA baseline (same 56-day window)"] = float(
+crps_rows["ARIMA baseline"] = float(
     crps_gaussian(
         arima_arrays["y_test"], arima_arrays["forecast_mean"], arima_arrays["forecast_sd"]
     ).mean()
@@ -280,16 +335,13 @@ plt.show()
 #
 # The fractions are diagnostic for the inference comparison too: a
 # surrogate that under-states posterior spread must report a smaller
-# epistemic share. Whether this mean-field fit does is exactly what the
-# NUTS adjudication on the collapsed model in notebook 04 makes precise.
+# epistemic share, so the gap between the two guides previews what the
+# NUTS adjudication in notebook 04 makes precise.
 
 # %%
-from nemforecastdemand.models.predict import variance_decomposition
-
-decomp = {}
-for kind, (arrays, _meta) in fits.items():
-    draws = {site: arrays[f"draw_{site}"] for site in bsts.HYPER_SITES}
-    decomp[kind] = variance_decomposition(draws, inputs, panel, cfg, test_origins)
+decomp = {
+    kind: variance_decomposition(draws_of(kind), inputs, panel, cfg, test_origins) for kind in fits
+}
 
 component_order = ["observation", "process", "state", "parameter"]
 component_colours = {
@@ -299,23 +351,24 @@ component_colours = {
     "parameter": "#1f5673",
 }
 hours = (np.arange(cfg.horizon) + 1) / 2
-fig, ax = plt.subplots(figsize=(7.5, 4))
-parts = decomp["meanfield"]
-total = sum(parts.values())
-shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
-ax.stackplot(
-    hours,
-    shares,
-    labels=component_order,
-    colors=[component_colours[n] for n in component_order],
-    alpha=0.95,
-)
-ax.set_title("mean-field")
-ax.set_xlabel("lead time (hours)")
-ax.set_ylim(0, 1)
-ax.set_xlim(hours[0], hours[-1])
-ax.set_ylabel("share of predictive variance")
-ax.legend(loc="center right", fontsize=8)
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+for ax, kind in zip(axes, fits, strict=True):
+    parts = decomp[kind]
+    total = sum(parts.values())
+    shares = np.stack([(parts[name] / total).mean(axis=0) for name in component_order])
+    ax.stackplot(
+        hours,
+        shares,
+        labels=component_order,
+        colors=[component_colours[n] for n in component_order],
+        alpha=0.95,
+    )
+    ax.set_title(kind)
+    ax.set_xlabel("lead time (hours)")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(hours[0], hours[-1])
+axes[0].set_ylabel("share of predictive variance")
+axes[1].legend(loc="center right", fontsize=8)
 fig.suptitle("Variance shares by lead time: greys aleatoric, blues epistemic", y=1.03)
 save_figure(fig, "bsts_vi_variance_decomposition", cfg.paths.figures)
 plt.show()
@@ -331,21 +384,10 @@ for kind in fits:
 pd.DataFrame(rows).T.round(3)
 
 # %% [markdown]
-# The allocation is striking: this fit attributes about 95% of its
-# predictive variance to the observation-noise floor and essentially none
-# to future trend innovations, because its posterior pushes the
-# innovation scales towards zero. Taken at face value that says the trend
-# is nearly deterministic and almost nothing would be gained by more
-# data. But if the surrogate under-estimates those scales, the same
-# decomposition under the reference posterior should move variance into
-# the process and parameter shares, and notebook 04 runs exactly that
-# check on the collapsed model.
-
-# %% [markdown]
 # ## Cost
 #
 # Fit and forecast wall-clock per surrogate (the forecast time covers all
-# 112 origins under all six weather variants, dominated by the one-off
+# test origins under all six weather variants, dominated by the one-off
 # Kalman filter pass over the posterior).
 
 # %%
@@ -364,18 +406,13 @@ pd.DataFrame(
 # %% [markdown]
 # ## Summary
 #
-# - The mean-field surrogate optimises cleanly on a 5,400-dimensional
-#   geometry and is the only inference path that survives it: cold NUTS
-#   was stopped after seventeen hours and the full-rank factor diverged
-#   twice, both documented above as findings rather than worked around.
+# - Both Gaussian families optimise stably on the marginalised geometry;
+#   the tables above quantify the entropy gap and the correlations the
+#   factorised family discards.
 # - The heteroskedastic head learns a plausible daily risk profile, and
 #   the exact variance decomposition names where predictive uncertainty
 #   comes from at each lead time.
-# - Predictively the fit clears the seasonal-naive floor (364 against 374
-#   MW CRPS) but trails the matched-window classical baseline (301 MW):
-#   imposed structure does not pay for the short window on this task.
-#   What more data and exact marginalisation buy the same model is the
-#   question notebooks 04 and 05 answer.
-# - Whether this posterior is too tight cannot be judged here, because no
-#   reference posterior exists on this formulation; the adjudication runs
-#   against collapsed NUTS in notebook 04.
+# - The predictive comparison against the classical baseline and the rest
+#   of the field is notebook 05's job; the adjudication of both surrogates
+#   against the NUTS reference posterior, including warm-start pricing,
+#   is notebook 04's.

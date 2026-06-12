@@ -9,43 +9,43 @@ calibration and computational cost.
 
 ## The comparison
 
-Every model sees the same design matrix (local-clock seasonal basis,
-temperature, dew point, direct and diffuse irradiance, degree days, demand
-lags, holidays) and is scored on identical rolling test origins under
-identical weather-input variants.
+Every model trains on the same chronological split, sees the same design
+matrix (local-clock seasonal basis, temperature, dew point, direct and
+diffuse irradiance, degree days, demand lags, holidays), fits the full
+history before the test boundary and is scored on identical rolling test
+origins under identical weather-input variants.
 
-| Model | Training window | Predictive form | Role |
-| --- | --- | --- | --- |
-| Seasonal naive | 56 days | Gaussian band from weekly-naive errors | the floor and the MASE base |
-| Dynamic harmonic regression + ARIMA errors | 56 days and full year | analytic Gaussian, homoskedastic | strong classical baseline |
-| LightGBM, 15 quantile heads | full year (and a 56-day ablation) | regularised quantiles | industry point-model foil |
-| BSTS, explicit states (~5,400 sampled dims) | 56 days | posterior predictive paths | mean-field ADVI only; the stress test |
-| BSTS, collapsed states (~53 sampled dims) | full year | posterior predictive paths | the production formulation |
+| Model | Predictive form | Role |
+| --- | --- | --- |
+| Seasonal naive | Gaussian band from weekly-naive errors | the floor and the MASE base |
+| Dynamic harmonic regression + ARIMA errors | analytic Gaussian, homoskedastic | strong classical baseline |
+| LightGBM, 15 quantile heads | regularised quantiles | industry point-model foil |
+| BART (Bayesian additive regression trees) | posterior predictive draws | Bayesian tree ensemble against LightGBM |
+| BSTS, collapsed states (~53 sampled dims) | posterior predictive paths | the inference testbed |
 
 The BSTS is a stochastic local linear trend (damped slope) with static
 seasonal regression, weather and lagged-demand regressors and a
-heteroskedastic log-linear observation scale. It appears in two
-formulations of the same generative model. The **explicit** form samples
-the latent states (scan-based, non-centred innovations), the way the model
-would naively be written in any probabilistic programming language; every
-half hour adds two latent dimensions, so 56 days already means ~5,400 of
-them. Only mean-field ADVI survives that geometry. NUTS was stopped after
-seventeen hours on the GPU without completing its 2,000 iterations, and
-the full-rank guide diverged twice (its dense Cholesky factor holds
-roughly fifteen million entries against 2,688 observations, so it would
-be underdetermined even if it optimised); both failures are reported as
-findings rather than worked around. The **collapsed** form marginalises
-the states analytically through a Kalman filter inside the likelihood, so
-inference runs over roughly fifty hyperparameters regardless of data
-length; the full training year becomes tractable, the full covariance
-becomes a well-determined object and the identical sampling schedule
-finishes in under an hour on CPU alone. The collapsed formulation is
-fitted five ways:
-mean-field ADVI (`AutoNormal`), full-rank ADVI (`AutoMultivariateNormal`),
-cold NUTS (the reference posterior) and warm-started NUTS with chain
-positions and the frozen inverse mass matrix taken from each surrogate
-(diagonal from mean-field, dense from full-rank) over a grid of reduced
-warmups.
+heteroskedastic log-linear observation scale, with the latent states
+marginalised analytically through a Kalman filter inside the likelihood,
+so inference runs over roughly fifty hyperparameters regardless of data
+length. The marginalisation is a documented finding, not a stylistic
+choice: written the naive way, with every half hour's innovations as
+latent draws, the model costs two dimensions per half hour, and on that
+geometry cold NUTS did not complete 2,000 iterations in seventeen hours
+on the GPU while the full-rank guide diverged, a dense Cholesky over
+thousands of dimensions being underdetermined at any setting. Collapsed,
+the same sampling schedule finishes in under an hour on CPU alone. The
+model is fitted five ways: mean-field ADVI (`AutoNormal`), full-rank ADVI
+(`AutoMultivariateNormal`), cold NUTS (the reference posterior) and
+warm-started NUTS with chain positions and the frozen inverse mass matrix
+taken from each surrogate (diagonal from mean-field, dense from
+full-rank) over a grid of reduced warmups.
+
+BART is the Bayesian counterpart to LightGBM: a sum-of-trees prior with
+posterior uncertainty over the regression function. Its tree structures
+are discrete, so neither ADVI nor NUTS applies; it is fitted by its
+native particle-Gibbs sampler (`pymc-bart`) and joins the comparison on
+the model-class axis with full predictive draws.
 
 Prediction is Rao-Blackwellised for every Bayesian fit: conditional on
 hyperparameter draws the model is linear-Gaussian, so rolling-origin
@@ -56,23 +56,17 @@ The axes of comparison, and where each is answered:
 
 1. **Inference algorithm at fixed model** (mean-field against full-rank
    against NUTS): posterior fidelity on marginals and correlations,
-   predictive consequences, cost. The adjudication runs on the collapsed
-   model in notebook 04; notebook 03 documents why only mean-field
-   survives the explicit geometry.
+   predictive consequences, cost, and the exact aleatoric-epistemic split
+   of predictive variance as an inference diagnostic. Notebooks 03 and 04.
 2. **Warm-start economics**: cold total against ADVI fit plus reduced
    warmup plus sampling, judged only at matched quality (target bulk ESS,
    clean R-hat, no divergences). Notebook 04.
-3. **Formulation against geometry** (explicit ~5,400 dimensions on 56 days
-   against collapsed ~53 dimensions on the full year): where NUTS and the
-   full-rank guide become intractable, where mean-field still works and
-   what marginalisation buys back. Notebooks 03 and 04.
-4. **Model class and training window** (Bayesian against classical against
-   gradient-boosted against naive): accuracy, calibration, joint-path
-   coherence, statistical significance and robustness to degrading weather
-   inputs, with ARIMA and LightGBM each fitted at both windows so data
-   quantity separates from model class. Notebook 05.
-5. **Hardware**: the collapsed suite fitted identically on the GPU and on
-   32 CPU cores. Notebook 04.
+3. **Model class** (structural Bayesian against classical against
+   gradient-boosted against Bayesian trees against naive): accuracy,
+   calibration, joint-path coherence, statistical significance and
+   robustness to degrading weather inputs. Notebook 05.
+4. **Hardware**: the BSTS suite fitted identically on the GPU and on the
+   CPU's cores (chains in parallel). Notebook 04.
 
 ## Task and data
 
@@ -108,14 +102,12 @@ Headline test-set scores (archived forecast weather) are produced in
    the committed splits.
 2. [`02_baseline_arima`](notebooks/02_baseline_arima.ipynb): order
    selection, the trigonometric-versus-RBF basis assessment, calibration
-   and test scores for the classical baseline at the 56-day and full-year
-   training windows.
-3. [`03_bsts_vi`](notebooks/03_bsts_vi.ipynb): the explicit-state BSTS
-   fitted by mean-field ADVI, with the ELBO decomposed into energy and
-   entropy as it trains, the learned heteroskedastic variance profile,
-   the aleatoric-epistemic split of predictive variance, posterior
-   predictive forecasts and the documented failures of NUTS and the
-   full-rank guide on this geometry.
+   and test scores for the classical baseline.
+3. [`03_bsts_vi`](notebooks/03_bsts_vi.ipynb): the BSTS fitted by
+   mean-field and full-rank ADVI, with the ELBO decomposed into energy
+   and entropy as it trains, the learned heteroskedastic variance
+   profile, the aleatoric-epistemic split of predictive variance and
+   posterior predictive forecasts.
 4. [`04_bsts_nuts`](notebooks/04_bsts_nuts.ipynb): NUTS on the collapsed
    formulation with full diagnostics as the reference posterior, ADVI
    adjudicated against it, the honest cold-versus-warm-start accounting at
@@ -136,16 +128,11 @@ pip install -e .
 python scripts/download_aemo.py      # NEMWeb weekly archives -> data/raw, data/interim
 python scripts/download_weather.py   # Open-Meteo ERA5 + previous-runs -> data/raw
 python scripts/build_dataset.py      # processed train/val/test parquet (committed)
-python scripts/fit_arima.py          # order selection + 56-day and full-year fits -> artifacts/
-python scripts/fit_gbdt.py           # LightGBM quantile heads + window ablation -> artifacts/
-python scripts/fit_bsts_vi.py        # explicit-state ADVI fits + forecasts -> artifacts/
-python scripts/fit_bsts_collapsed.py # collapsed full-year ADVI + NUTS + warm starts -> artifacts/
+python scripts/fit_arima.py          # order selection + full-history fit -> artifacts/
+python scripts/fit_gbdt.py           # LightGBM quantile heads -> artifacts/
+python scripts/fit_bart.py           # BART posterior predictive draws -> artifacts/
+python scripts/fit_bsts_collapsed.py # BSTS ADVI + NUTS + warm starts -> artifacts/
 ```
-
-`scripts/fit_bsts_nuts.py` remains as the record of the explicit-state
-NUTS attempt but is not part of reproduction: the cold run was stopped
-after seventeen hours on the GPU without completing, which is the
-intractability finding notebook 04 reports.
 
 The processed splits are committed, so the model scripts and notebooks run
 without any downloads. NEMWeb retains roughly thirteen months of demand

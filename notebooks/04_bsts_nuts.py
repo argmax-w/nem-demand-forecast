@@ -16,16 +16,12 @@
 # %% [markdown]
 # # 04. The same model, fitted by NUTS
 #
-# Identical generative model, identical priors; only the inference and the
-# handling of the latent states change. This notebook is the
+# Identical generative model, identical priors, identical data to notebook
+# 03; only the inference algorithm changes. This notebook is the
 # reference-posterior side of the project: NUTS with four vectorised chains
 # and a full diagnostic battery, the two ADVI surrogates adjudicated against
 # it, the warm start priced honestly and the hardware question settled. It
 # reads the artifacts of `scripts/fit_bsts_collapsed.py`.
-#
-# It opens, though, with the result that shaped it: on the explicit-state
-# formulation that notebook 03 fitted by ADVI in minutes, NUTS is not
-# practically available at all.
 
 # %%
 import json
@@ -53,62 +49,30 @@ vi_fits = {
 }
 
 # %% [markdown]
-# ## The explicit states are where NUTS stops
+# ## Why these are the only formulations on the table
 #
-# The explicit formulation samples every half hour's level and slope
-# innovation directly: with the hyperparameters that is roughly 5,400
-# dimensions for its 56-day window, and every additional day adds 96 more.
-# ADVI handles that geometry comfortably. NUTS does not. The cold run (four
-# vectorised chains, 1,000 warmup plus 1,000 sampling iterations, maximum
-# tree depth 10) was stopped after seventeen hours on the RTX 4000 Ada
-# without completing; the arithmetic is unforgiving, because a depth-10
-# trajectory costs up to 1,023 gradient evaluations per iteration per
-# chain, and each gradient back-propagates through the full 2,688-step
-# scan. That is not a tuning accident to be worked around but the honest
-# price of asking a trajectory-based sampler to explore thousands of
-# correlated state dimensions, and it is reported here as a finding.
+# The marginalised likelihood is a deliberate design choice with a
+# documented motivation. Written the naive way, with every half hour's
+# level and slope innovation as a latent draw, the same model costs two
+# dimensions per half hour: a year of data would mean roughly 70,000 of
+# them, and even an eight-week window means ~5,400. On that geometry the
+# toolkit collapses. Cold NUTS (four vectorised chains, 1,000 warmup plus
+# 1,000 sampling iterations, depth-10 trees costing up to 1,023 gradient
+# evaluations per iteration per chain) was stopped after seventeen hours
+# on the RTX 4000 Ada without completing, and the full-rank guide
+# diverged, its dense Cholesky being underdetermined at thousands of
+# dimensions regardless of tuning. Those failures are findings, not
+# tuning accidents: trajectory-based samplers and dense covariances do
+# not survive thousands of correlated state dimensions.
 #
-# The remedy is not a bigger GPU. Conditional on the hyperparameters the
-# trend is linear-Gaussian, so a Kalman filter inside the likelihood
-# integrates the states out exactly: the **collapsed** formulation samples
-# only the roughly fifty hyperparameters, at the cost of running a
-# sequential filter over the data inside every gradient. The cost moves
-# from dimension to gradient, the dimension count stops depending on the
-# window length, and the full training year becomes affordable; the states
-# are recovered afterwards by the same filter, which is also how every
-# prediction in this project is Rao-Blackwellised. Same priors, same
-# structure, more data, and a posterior NUTS can actually certify.
-
-# %%
-explicit_vi_meta = {
-    kind: json.loads((cfg.paths.artifacts / f"bsts_vi_{kind}.json").read_text())
-    for kind in ("meanfield", "fullrank")
-}
-explicit_dims = 2 * cfg.bsts.train_days * 48 + 55
-collapsed_dims = sum(row["size"] for row in cold_meta["site_summary"])
-timing = cold_meta["timings_seconds"]
-pd.DataFrame(
-    {
-        "explicit states, 56 days": {
-            "latent dimensions": f"~{explicit_dims:,}",
-            "data half hours": f"{cfg.bsts.train_days * 48:,}",
-            "ADVI mean-field fit": (
-                f"{explicit_vi_meta['meanfield']['timings_seconds']['fit_seconds']:,.0f} s"
-            ),
-            "NUTS cold (1,000 + 1,000)": "stopped after 17 h, incomplete",
-        },
-        "collapsed states, full year": {
-            "latent dimensions": f"{collapsed_dims}",
-            "data half hours": f"{cold_meta['fit_steps']:,}",
-            "ADVI mean-field fit": (
-                f"{vi_fits['meanfield'][1]['timings_seconds']['fit_seconds']:,.0f} s"
-            ),
-            "NUTS cold (1,000 + 1,000)": (
-                f"{timing['warmup_seconds'] + timing['sample_seconds']:,.0f} s"
-            ),
-        },
-    }
-)
+# The Kalman filter inside the likelihood removes the problem at its
+# source: conditional on the hyperparameters the trend is linear-Gaussian,
+# so the states integrate out exactly and inference works over roughly
+# fifty hyperparameters however long the data. The cost moves from
+# dimension to gradient (a sequential filter pass inside every gradient
+# evaluation), the full training year becomes affordable for ADVI and
+# NUTS alike and the states are recovered afterwards by the same filter,
+# which is also how every prediction in this project is Rao-Blackwellised.
 
 # %% [markdown]
 # ## Sampler health
@@ -125,6 +89,7 @@ summary = pd.DataFrame(cold_meta["site_summary"]).set_index("site")
 summary.round(4)
 
 # %%
+timing = cold_meta["timings_seconds"]
 health = pd.DataFrame(cold_meta["chain_health"]).set_index("chain")
 display_cols = pd.DataFrame(
     {
@@ -458,10 +423,9 @@ pd.DataFrame(bench_rows).T.round(2)
 # %% [markdown]
 # ## Summary
 #
-# - On the explicit-state formulation NUTS is intractable in practice: the
-#   cold run was stopped after seventeen hours without completing, while
-#   ADVI fitted the same geometry in minutes. The finding motivates the
-#   collapsed formulation rather than a workaround.
+# - Written with explicit states the model defeats NUTS (seventeen hours,
+#   incomplete, stopped) and the full-rank guide alike; the marginalised
+#   likelihood is what makes the rest of this notebook possible.
 # - On the collapsed model NUTS passes its full diagnostic battery on a
 #   full year of data and stands as the reference posterior.
 # - The surrogate adjudication, the warm-start accounting at matched

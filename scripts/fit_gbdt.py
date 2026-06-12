@@ -46,17 +46,6 @@ def main() -> None:
     with timed("fit", timings):
         model.fit(panel, splits["train"].index, validation_index=splits["validation"].index)
 
-    # Window ablation: the same protocol restricted to the 56-day tail the
-    # time-series models use, separating the contribution of model class
-    # from training-data quantity in the comparison.
-    ablation = LightGbmQuantile(cfg)
-    with timed("ablation_fit", timings):
-        ablation.fit(
-            panel,
-            splits["train"].index[-cfg.bsts.train_days * 48 :],
-            validation_index=splits["validation"].index,
-        )
-
     perturbations = fit_perturbation_models(panel, splits["train"].index)
     with timed("test_forecasts", timings):
         variants = run_variants(
@@ -77,13 +66,7 @@ def main() -> None:
             for i in range(y_test.shape[0])
         ]
     )
-    ablation_scores = []
-    for i, origin in enumerate(test_origins):
-        fc = ablation.forecast(panel, origin, "forecast")
-        ablation_scores.append(crps_from_quantiles(y_test[i], fc.quantile_values, levels).mean())
     meta = {
-        "window_ablation_crps_mw": float(np.mean(ablation_scores)),
-        "window_ablation_days": cfg.bsts.train_days,
         "quantile_levels": list(model.quantiles),
         "best_iterations": {f"{k:g}": v for k, v in model.best_iterations.items()},
         "timings_seconds": timings,

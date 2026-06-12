@@ -75,10 +75,9 @@ class FeatureConfig:
 
 @dataclass(frozen=True)
 class ArimaConfig:
-    """Baseline settings: candidate residual orders and fitting window."""
+    """Baseline settings: the candidate residual orders."""
 
     candidate_orders: tuple[tuple[int, int, int], ...]
-    train_days: int
 
 
 @dataclass(frozen=True)
@@ -103,7 +102,6 @@ class BstsPriors:
 class BstsConfig:
     """Structural model settings."""
 
-    train_days: int
     damped_slope: bool
     obs_family: str
     heteroskedastic: bool
@@ -250,10 +248,8 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         arima=ArimaConfig(
             candidate_orders=_as_int_triples(raw["arima"]["candidate_orders"]),
-            train_days=int(raw["arima"]["train_days"]),
         ),
         bsts=BstsConfig(
-            train_days=int(raw["bsts"]["train_days"]),
             damped_slope=bool(raw["bsts"]["damped_slope"]),
             obs_family=raw["bsts"]["obs_family"],
             heteroskedastic=bool(raw["bsts"]["heteroskedastic"]),
