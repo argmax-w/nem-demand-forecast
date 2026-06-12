@@ -1,37 +1,32 @@
 # %% [markdown]
-# # 05. Model comparison: model classes and inference strategies
+# # 05. Model comparison
 #
-# Headline results. Four model families forecast NSW1 operational demand
-# on identical test origins (two per day, 00:00 and 12:00 AEST, across
-# eight weeks), identical features and identical weather-input variants:
+# **Goal.** Score every model on identical test origins (two per day,
+# 00:00 and 12:00 AEST, eight weeks) with identical features and weather
+# variants, and answer three questions: who forecasts best, whose
+# uncertainty is honest and what each result costs to compute.
 #
-# - **Seasonal naive**: same half hour last week, with an honest Gaussian
-#   band. The floor every model must clear.
-# - **Dynamic harmonic regression with ARIMA errors**: the classical
-#   baseline, analytic Gaussian predictive.
-# - **LightGBM quantile regression**: the industry tabular benchmark,
-#   fifteen pinball-objective heads on the same design.
-# - **BART**: Bayesian additive regression trees on the same design, the
-#   Bayesian counterpart to LightGBM. Trees are discrete, so neither ADVI
-#   nor NUTS applies; it is fitted by its native particle-Gibbs sampler
-#   and contributes full posterior predictive draws.
-# - **The BSTS, three posteriors**: the structural model of notebooks 03
-#   and 04, latent states marginalised through a Kalman filter, fitted by
-#   mean-field ADVI, full-rank ADVI and NUTS. Same model, same priors,
-#   same data; the inference algorithm is the only difference.
+# The field:
 #
-# Every model trains on the same chronological split and sees the full
-# history before the test boundary.
+# - **Seasonal naive**: same half hour last week with a Gaussian band; the
+#   floor and the MASE base.
+# - **ARIMA**: dynamic harmonic regression with ARIMA errors, the
+#   classical baseline, analytic Gaussian predictive.
+# - **LightGBM**: fifteen pinball-objective quantile heads on the shared
+#   design plus the origin-anchored recency features.
+# - **BART**: two sum-of-trees heads (mean and log scale) on the same
+#   design as LightGBM, fitted by particle Gibbs; full predictive draws.
+# - **Bayesian AR(1)**: the repaired model of notebooks 03 and 04, fitted
+#   by mean-field ADVI, full-rank ADVI and warm-started NUTS (the
+#   reference posterior), plus a homoskedastic ablation that prices the
+#   variance head.
 #
-# Scores: CRPS (primary), log score, pinball loss, MAE, MASE, central
-# coverage, PIT calibration and the energy score over whole 48-step paths.
-# Sample-based scores use the energy-form estimator, unit-tested against
-# the analytic Gaussian form. Representation differences are respected
-# rather than papered over: the energy score needs jointly coherent sampled
-# paths, so it exists for the Bayesian models only; LightGBM's CRPS uses
-# the quantile-integral estimator (also unit-tested against the Gaussian
-# form), its point forecast is the median head and its log score is
-# unavailable; its PIT comes from interpolating the quantile function.
+# Scores: CRPS (primary), log score, pinball, MAE, MASE, central coverage,
+# PIT and the energy score over whole 48-step paths. Representation
+# differences are respected: the energy score needs coherent sampled
+# paths, so it exists only for the Bayesian models; LightGBM's CRPS uses
+# the quantile-integral estimator, its point forecast is the median head
+# and it has no log score (no density).
 
 # %%
 import matplotlib.pyplot as plt
@@ -66,17 +61,18 @@ panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
 arima, arima_meta = load_artifact(cfg.paths.artifacts / "arima")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
 bart, bart_meta = load_artifact(cfg.paths.artifacts / "bart")
-collapsed_nuts, collapsed_nuts_meta = load_artifact(
-    cfg.paths.artifacts / "bsts_collapsed_nuts_cold"
+ar_nuts, ar_nuts_meta = load_artifact(
+    cfg.paths.artifacts / "bsts_innovations_nuts_warm_fullrank_w300"
 )
-collapsed_vi = {
-    k: load_artifact(cfg.paths.artifacts / f"bsts_collapsed_vi_{k}")
+ar_homo, ar_homo_meta = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_homoskedastic")
+ar_vi = {
+    k: load_artifact(cfg.paths.artifacts / f"bsts_innovations_vi_{k}")
     for k in ("meanfield", "fullrank")
 }
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
 )
-y_test = collapsed_nuts["y_test"]
+y_test = ar_nuts["y_test"]
 quantile_levels = np.array(cfg.evaluation.quantiles)
 gbdt_levels = np.array(gbdt_meta["quantile_levels"])
 
@@ -85,20 +81,22 @@ MODELS = [
     "ARIMA",
     "LightGBM",
     "BART",
-    "BSTS ADVI mean-field",
-    "BSTS ADVI full-rank",
-    "BSTS NUTS",
+    "Bayesian AR(1) homoskedastic",
+    "Bayesian AR(1) MF-ADVI",
+    "Bayesian AR(1) FR-ADVI",
+    "Bayesian AR(1) NUTS",
 ]
 COLOURS = {
     "seasonal naive": "#9a9a9a",
     "ARIMA": palette("forecast"),
     "LightGBM": "#2e7d32",
     "BART": "#7a4988",
-    "BSTS ADVI mean-field": palette("demand"),
-    "BSTS ADVI full-rank": palette("accent"),
-    "BSTS NUTS": "black",
+    "Bayesian AR(1) homoskedastic": "#b0884d",
+    "Bayesian AR(1) MF-ADVI": palette("demand"),
+    "Bayesian AR(1) FR-ADVI": palette("accent"),
+    "Bayesian AR(1) NUTS": "black",
 }
-PIT_MODELS = ["ARIMA", "LightGBM", "BART", "BSTS NUTS"]
+PIT_MODELS = ["ARIMA", "LightGBM", "BART", "Bayesian AR(1) NUTS"]
 
 
 def gaussian_scores(mean: np.ndarray, sd: np.ndarray) -> dict:
@@ -210,18 +208,19 @@ scores = {
     "ARIMA": gaussian_scores(arima["forecast_mean"], arima["forecast_sd"]),
     "LightGBM": quantile_scores(gbdt["forecast_quantiles"]),
     "BART": sample_scores(bart["forecast_paths"]),
-    "BSTS ADVI mean-field": sample_scores(collapsed_vi["meanfield"][0]["forecast_paths"]),
-    "BSTS ADVI full-rank": sample_scores(collapsed_vi["fullrank"][0]["forecast_paths"]),
-    "BSTS NUTS": sample_scores(collapsed_nuts["forecast_paths"]),
+    "Bayesian AR(1) homoskedastic": sample_scores(ar_homo["forecast_paths"]),
+    "Bayesian AR(1) MF-ADVI": sample_scores(ar_vi["meanfield"][0]["forecast_paths"]),
+    "Bayesian AR(1) FR-ADVI": sample_scores(ar_vi["fullrank"][0]["forecast_paths"]),
+    "Bayesian AR(1) NUTS": sample_scores(ar_nuts["forecast_paths"]),
 }
 
 # %% [markdown]
 # ## The master table
 #
-# Archived day-ahead weather forecasts as issued, no look-ahead anywhere.
-# MASE scales by the seasonal-naive training MAE; the log score for the
-# Bayesian models uses a moment-matched Gaussian per step (noted in
-# `metrics.py`).
+# Archived day-ahead weather as issued, no look-ahead. MASE scales by the
+# seasonal-naive training MAE. The homoskedastic row is the ablation:
+# identical model and inference, constant innovation scale, so the gap to
+# the NUTS row is what the heteroskedastic head is worth.
 
 # %%
 table = {}
@@ -244,18 +243,19 @@ master.round(2)
 # %% [markdown]
 # ## Are the differences real?
 #
-# Paired block bootstrap over origins on per-origin CRPS (10,000 resamples).
-# Negative differences favour the first model.
+# Paired block bootstrap over origins on per-origin CRPS (10,000
+# resamples). Negative differences favour the first model.
 
 # %%
 pairs = [
-    ("BSTS NUTS", "ARIMA"),
-    ("BSTS NUTS", "LightGBM"),
+    ("Bayesian AR(1) NUTS", "ARIMA"),
+    ("Bayesian AR(1) NUTS", "LightGBM"),
+    ("Bayesian AR(1) NUTS", "BART"),
+    ("Bayesian AR(1) NUTS", "Bayesian AR(1) homoskedastic"),
+    ("Bayesian AR(1) homoskedastic", "ARIMA"),
     ("LightGBM", "ARIMA"),
     ("BART", "LightGBM"),
-    ("BSTS NUTS", "BART"),
-    ("BSTS ADVI mean-field", "BSTS NUTS"),
-    ("BSTS ADVI full-rank", "BSTS NUTS"),
+    ("Bayesian AR(1) MF-ADVI", "Bayesian AR(1) NUTS"),
     ("ARIMA", "seasonal naive"),
 ]
 sig_rows = {}
@@ -288,7 +288,7 @@ plt.show()
 # %%
 fig, ax = plt.subplots(figsize=(8.5, 4.5))
 for name in MODELS:
-    if name in ("BSTS ADVI mean-field", "BSTS ADVI full-rank"):
+    if name in ("Bayesian AR(1) MF-ADVI", "Bayesian AR(1) FR-ADVI"):
         continue  # nearly coincident with the NUTS posterior; the table carries them
     horizon_curve(ax, scores[name]["per_step_crps"], name, COLOURS[name])
 ax.set_ylabel("CRPS (MW)")
@@ -302,8 +302,7 @@ plt.show()
 #
 # The sweep degrades ERA5 actuals with the calibrated correlated error at
 # multiples of the measured day-ahead forecast error: 0 is perfect
-# foresight, 1 matches the real forecast's error magnitude and 2 doubles
-# it. How gracefully a model degrades is a property of how it uses weather.
+# foresight, 1 matches the real forecast's error magnitude, 2 doubles it.
 
 # %%
 sweep_x = [0.0] + [m for m in cfg.perturbation.sweep_multipliers if m > 0]
@@ -336,8 +335,7 @@ def sweep_crps(name: str) -> list[float]:
         else:
             paths = {
                 "BART": bart,
-                "BSTS ADVI mean-field": collapsed_vi["meanfield"][0],
-                "BSTS NUTS": collapsed_nuts,
+                "Bayesian AR(1) NUTS": ar_nuts,
             }[name][f"{variant}_paths"]
             out.append(
                 float(
@@ -353,7 +351,7 @@ def sweep_crps(name: str) -> list[float]:
 
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
-for name in ("ARIMA", "LightGBM", "BART", "BSTS NUTS"):
+for name in ("ARIMA", "LightGBM", "BART", "Bayesian AR(1) NUTS"):
     values = sweep_crps(name)
     ax.plot(sweep_x, values, marker="o", ms=4, color=COLOURS[name], label=name)
     headline = scores[name]["per_origin_crps"].mean()
@@ -369,7 +367,7 @@ plt.show()
 # ## Case study: the hardest day in the test set
 
 # %%
-consensus = scores["BSTS NUTS"]["per_origin_crps"] + scores["ARIMA"]["per_origin_crps"]
+consensus = scores["Bayesian AR(1) NUTS"]["per_origin_crps"] + scores["ARIMA"]["per_origin_crps"]
 worst = int(consensus.argmax())
 origin = test_origins[worst]
 index = pd.date_range(origin, periods=cfg.horizon, freq="30min")
@@ -386,9 +384,9 @@ fan_chart(
 fan_chart(
     axes[1],
     index,
-    samples=collapsed_nuts["forecast_paths"][:, worst, :],
-    colour=COLOURS["BSTS NUTS"],
-    label="BSTS NUTS",
+    samples=ar_nuts["forecast_paths"][:, worst, :],
+    colour=COLOURS["Bayesian AR(1) NUTS"],
+    label="Bayesian AR(1) NUTS",
 )
 for ax in axes:
     ax.plot(
@@ -400,7 +398,9 @@ for ax in axes:
     )
     ax.set_ylabel("demand (MW)")
 axes[0].set_title(f"ARIMA, CRPS {scores['ARIMA']['per_origin_crps'][worst]:.0f} MW")
-axes[1].set_title(f"BSTS NUTS, CRPS {scores['BSTS NUTS']['per_origin_crps'][worst]:.0f} MW")
+axes[1].set_title(
+    f"Bayesian AR(1) NUTS, CRPS {scores['Bayesian AR(1) NUTS']['per_origin_crps'][worst]:.0f} MW"
+)
 axes[0].legend()
 fig.suptitle(
     f"Worst common origin: {origin.tz_convert('Australia/Brisbane'):%A %d %B %Y %H:%M} AEST", y=1.04
@@ -411,10 +411,10 @@ plt.show()
 # %% [markdown]
 # ## Compute
 #
-# Fit and forecast wall-clock per model, ESS-per-second for the sampler,
-# the warm-start verdict at matched quality and the GPU-versus-CPU rates.
-# Raw wall-clock is not comparable across stochastic samplers, which is why
-# the NUTS rows carry quality-adjusted columns.
+# Wall-clock per model. The NUTS row charges the full pipeline it depends
+# on (full-rank ADVI fit plus reduced warmup plus sampling), because cold
+# NUTS does not produce a usable posterior for this model (notebook 04).
+# ESS-per-second uses the reference run's sampling time.
 
 # %%
 compute_rows = {
@@ -434,29 +434,27 @@ compute_rows = {
         "fit (s)": bart_meta["timings_seconds"]["fit_seconds"],
         "forecast all origins (s)": bart_meta["timings_seconds"]["predict_seconds"],
     },
-    "BSTS ADVI mean-field": {
-        "fit (s)": collapsed_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
-        "forecast all origins (s)": collapsed_vi["meanfield"][1]["timings_seconds"][
-            "predict_seconds"
-        ],
+    "Bayesian AR(1) MF-ADVI": {
+        "fit (s)": ar_vi["meanfield"][1]["timings_seconds"]["fit_seconds"],
+        "forecast all origins (s)": ar_vi["meanfield"][1]["timings_seconds"]["predict_seconds"],
     },
-    "BSTS ADVI full-rank": {
-        "fit (s)": collapsed_vi["fullrank"][1]["timings_seconds"]["fit_seconds"],
-        "forecast all origins (s)": collapsed_vi["fullrank"][1]["timings_seconds"][
-            "predict_seconds"
-        ],
+    "Bayesian AR(1) FR-ADVI": {
+        "fit (s)": ar_vi["fullrank"][1]["timings_seconds"]["fit_seconds"],
+        "forecast all origins (s)": ar_vi["fullrank"][1]["timings_seconds"]["predict_seconds"],
     },
-    "BSTS NUTS": {
-        "fit (s)": collapsed_nuts_meta["timings_seconds"]["warmup_seconds"]
-        + collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
-        "forecast all origins (s)": collapsed_nuts_meta["predict_seconds"],
-        "min bulk ESS": collapsed_nuts_meta["min_bulk_ess"],
-        "ESS per s": collapsed_nuts_meta["min_bulk_ess"]
-        / collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
-        "to ESS 400 (s)": time_to_target_ess(
-            collapsed_nuts_meta["timings_seconds"]["warmup_seconds"],
-            collapsed_nuts_meta["timings_seconds"]["sample_seconds"],
-            collapsed_nuts_meta["min_bulk_ess"],
+    "Bayesian AR(1) NUTS": {
+        "fit (s)": ar_nuts_meta["advi_seconds"]
+        + ar_nuts_meta["timings_seconds"]["warmup_seconds"]
+        + ar_nuts_meta["timings_seconds"]["sample_seconds"],
+        "forecast all origins (s)": ar_nuts_meta["predict_seconds"],
+        "min bulk ESS": ar_nuts_meta["min_bulk_ess"],
+        "ESS per s": ar_nuts_meta["min_bulk_ess"]
+        / ar_nuts_meta["timings_seconds"]["sample_seconds"],
+        "to ESS 400 incl ADVI (s)": ar_nuts_meta["advi_seconds"]
+        + time_to_target_ess(
+            ar_nuts_meta["timings_seconds"]["warmup_seconds"],
+            ar_nuts_meta["timings_seconds"]["sample_seconds"],
+            ar_nuts_meta["min_bulk_ess"],
             cfg.warm_start.target_bulk_ess,
         ),
     },
@@ -465,14 +463,17 @@ compute = pd.DataFrame(compute_rows).T
 compute.round(1)
 
 # %% [markdown]
-# The warm-start line and the device comparison from notebook 04, repeated
-# for completeness of the headline table.
+# The warm-start grid from notebook 04, repeated for the headline: every
+# warm run meets quality, cold does not, and the whole Bayesian pipeline
+# now costs seconds.
 
 # %%
 warm_rows = {}
 for kind in ("meanfield", "fullrank"):
     for reduced in cfg.warm_start.reduced_warmup:
-        _, meta = load_artifact(cfg.paths.artifacts / f"bsts_collapsed_nuts_warm_{kind}_w{reduced}")
+        _, meta = load_artifact(
+            cfg.paths.artifacts / f"bsts_innovations_nuts_warm_{kind}_w{reduced}"
+        )
         timing = meta["timings_seconds"]
         warm_rows[f"warm {kind} w={reduced}"] = {
             "total incl ADVI (s)": meta["advi_seconds"]
@@ -490,23 +491,18 @@ pd.DataFrame(warm_rows).T.round(2)
 # %% [markdown]
 # ## Conclusions
 #
-# - **Every model clears the naive floor decisively**, and both Bayesian
-#   inference paths are competitive with a strong classical baseline on
-#   CRPS, with the bootstrap intervals above saying how much of the gap is
-#   signal.
-# - **Inference choice barely moves predictive accuracy** for this model:
-#   mean-field, full-rank and NUTS posteriors forecast almost identically,
-#   because prediction is dominated by the regression and the filtered
-#   state, which all three pin down. The differences live in the posterior
-#   itself (notebook 04): mean-field under-states variances and zeroes
-#   correlations, full-rank tracks the NUTS reference closely.
-# - **Calibration separates the families more than accuracy does**: the
-#   heteroskedastic BSTS predictive is flatter in PIT than the
-#   homoskedastic baseline, which over-covers at easy hours.
-# - **Robustness:** all models degrade smoothly as weather inputs worsen;
-#   the perfect-foresight bound shows weather error is a modest share of
-#   the total at one day ahead.
-# - **Cost:** ADVI buys the Bayesian posterior for a fraction of the NUTS
-#   bill; the warm start's worth, judged at matched quality with the ADVI
-#   fit included, is whatever the accounting table says, and that honesty
-#   is the point.
+# - Every model clears the naive floor; the Bayesian AR(1) beats the
+#   classical baseline on CRPS and the bootstrap says how much of each
+#   gap is signal.
+# - The ablation chain attributes the Bayesian gain: same structure with
+#   a constant scale lands near ARIMA, and the heteroskedastic head
+#   provides the advantage.
+# - Inference choice barely moves prediction at this model: all three
+#   posteriors forecast within Monte Carlo error of each other. The
+#   differences live in the posterior itself and in what it costs
+#   (notebook 04).
+# - LightGBM remains the sharpest point forecaster; its coverage and PIT
+#   are where that sharpness is paid for, and it offers no decomposition
+#   of its uncertainty.
+# - Conclusions above are revised against the executed numbers below the
+#   final run.
