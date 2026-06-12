@@ -96,6 +96,9 @@ class BstsPriors:
     init_level_scale: float
     init_slope_scale: float
     student_t_df_rate: float
+    # Beta prior on the AR(1) error persistence in the innovations form.
+    ar_alpha: float = 8.0
+    ar_beta: float = 2.0
 
 
 @dataclass(frozen=True)

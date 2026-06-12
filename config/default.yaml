@@ -101,6 +101,8 @@ bsts:
     init_level_scale: 2.0
     init_slope_scale: 0.1
     student_t_df_rate: 0.1 # Exponential rate for (df - 2) under student_t
+    ar_alpha: 8.0 # Beta prior on the AR(1) error persistence (innovations form)
+    ar_beta: 2.0
 
 vi:
   steps: 20000
