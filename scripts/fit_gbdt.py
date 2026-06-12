@@ -13,10 +13,9 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
-import pandas as pd
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_from_quantiles
 from nemforecastdemand.models.base import Forecast, run_variants
 from nemforecastdemand.models.gbdt import LightGbmQuantile
@@ -35,8 +34,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    panel = load_panel(cfg.paths.processed)
     splits = load_splits(cfg.paths.processed)
-    panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
     test_origins = rolling_origins(
         splits["test"].index, panel.index, cfg.origins, cfg.horizon, max_lag

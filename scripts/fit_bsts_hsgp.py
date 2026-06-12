@@ -31,10 +31,9 @@ def main() -> None:
 
     import jax.numpy as jnp
     import numpy as np
-    import pandas as pd
 
     from nemforecastdemand.config import load_config
-    from nemforecastdemand.data.loaders import load_splits
+    from nemforecastdemand.data.loaders import load_panel, load_splits
     from nemforecastdemand.models import bsts, hsgp
     from nemforecastdemand.models.inference_mcmc import fit_nuts, flatten_chains, warm_start_from_vi
     from nemforecastdemand.models.inference_vi import fit_advi
@@ -55,10 +54,10 @@ def main() -> None:
         ),
     )
 
+    panel = load_panel(cfg.paths.processed)
     splits = load_splits(cfg.paths.processed)
-    panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
-    fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+    fit_index = splits["train"].index[max_lag:]
     inputs = bsts.prepare_inputs(panel, cfg, fit_index)
     gp = hsgp.gp_metadata(inputs.columns, cfg.features)
     gp_jnp = {

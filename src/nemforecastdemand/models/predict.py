@@ -309,25 +309,31 @@ def variance_decomposition_innovations(
     return {name: value * inputs.y_scale**2 for name, value in parts.items()}
 
 
+PERTURBATION_VARIABLES = (
+    ("temp_c", "temp_fc_c", False),
+    ("dew_c", "dew_fc_c", False),
+    ("dni_wm2", "dni_fc_wm2", True),
+    ("dhi_wm2", "dhi_fc_wm2", True),
+)
+
+
 def fit_perturbation_models(panel: pd.DataFrame, train_index: pd.DatetimeIndex) -> dict:
-    """Calibrate the perturbation models on training data only."""
+    """Calibrate the perturbation models on training data only.
+
+    Each variable uses the training rows where a genuine archived forecast
+    exists, that is where the forecast column differs from the actual. The
+    early training period predates the forecast archive and carries actuals
+    in the forecast columns; including it would understate the day-ahead
+    error and flatten the robustness sweep, so it is dropped here.
+    """
     from nemforecastdemand.features.weather import fit_perturbation
 
-    return {
-        "temp_c": fit_perturbation(
-            panel["temp_c"].loc[train_index], panel["temp_fc_c"].loc[train_index]
-        ),
-        "dew_c": fit_perturbation(
-            panel["dew_c"].loc[train_index], panel["dew_fc_c"].loc[train_index]
-        ),
-        "dni_wm2": fit_perturbation(
-            panel["dni_wm2"].loc[train_index],
-            panel["dni_fc_wm2"].loc[train_index],
-            nonnegative=True,
-        ),
-        "dhi_wm2": fit_perturbation(
-            panel["dhi_wm2"].loc[train_index],
-            panel["dhi_fc_wm2"].loc[train_index],
-            nonnegative=True,
-        ),
-    }
+    models = {}
+    for actual_col, fc_col, nonnegative in PERTURBATION_VARIABLES:
+        actual = panel[actual_col].loc[train_index]
+        forecast = panel[fc_col].loc[train_index]
+        genuine = actual.to_numpy() != forecast.to_numpy()
+        models[actual_col] = fit_perturbation(
+            actual[genuine], forecast[genuine], nonnegative=nonnegative
+        )
+    return models

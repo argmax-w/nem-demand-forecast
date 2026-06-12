@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_samples
 from nemforecastdemand.features.weather import degree_days
 from nemforecastdemand.models.base import (
@@ -63,8 +63,8 @@ def main() -> None:
     tune = args.tune if args.tune is not None else bart.tune
     draws = args.draws if args.draws is not None else bart.draws
 
+    panel = load_panel(cfg.paths.processed)
     splits = load_splits(cfg.paths.processed)
-    panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
     # The week-ago recency deviation reads one step behind the longest lag,
     # hence max_lag + 1 when qualifying training origins.
@@ -145,8 +145,9 @@ def main() -> None:
     print(f"selected m={best_m}", flush=True)
 
     # Final fit on the full pre-test history (train plus validation), with
-    # scalers from the same window.
-    fit_origins = train_origins.union(validation_origins)
+    # scalers from the same window. The final fit uses the training origins
+    # only; validation served its purpose in selecting the tree count.
+    fit_origins = train_origins
     x_fit, y_fit = stacked_origin_design(panel, cfg, fit_origins)
     y_loc, y_scale = float(y_fit.mean()), float(y_fit.std())
     y_fit_std = ((y_fit - y_loc) / y_scale).to_numpy()

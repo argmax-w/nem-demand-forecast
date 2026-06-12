@@ -44,9 +44,8 @@ def main() -> None:
 
     import jax.numpy as jnp
     import numpy as np
-    import pandas as pd
 
-    from nemforecastdemand.data.loaders import load_splits
+    from nemforecastdemand.data.loaders import load_panel, load_splits
     from nemforecastdemand.models import bsts
     from nemforecastdemand.models.inference_mcmc import (
         NutsRun,
@@ -59,12 +58,12 @@ def main() -> None:
     from nemforecastdemand.splits import rolling_origins
     from nemforecastdemand.utils import save_artifact, timed
 
+    panel = load_panel(cfg.paths.processed)
     splits = load_splits(cfg.paths.processed)
-    panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
 
     # Full available history up to the test boundary, less the lag warmup.
-    fit_index = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+    fit_index = splits["train"].index[max_lag:]
     inputs = bsts.prepare_inputs(panel, cfg, fit_index)
     model_fn = partial(
         bsts.bsts_collapsed_model,

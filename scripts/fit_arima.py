@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from nemforecastdemand.config import load_config
-from nemforecastdemand.data.loaders import load_splits
+from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_gaussian
 from nemforecastdemand.features.weather import fit_perturbation
 from nemforecastdemand.models.arima import DynamicHarmonicRegression
@@ -46,15 +46,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    panel = load_panel(cfg.paths.processed)
     splits = load_splits(cfg.paths.processed)
-    panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)
 
-    # Selection trains on the full training split and scores on validation;
-    # the final fit then uses everything before the test boundary. The lag
-    # warmup is trimmed so the design has no missing demand lags.
+    # Selection trains on the training block and scores on validation; the
+    # final fit uses the same training block, since the evaluation windows
+    # are held out. The lag warmup is trimmed so the design has no missing
+    # demand lags.
     train_fit = splits["train"].index[max_lag:]
-    final_fit = panel.index[panel.index < splits["test"].index[0]][max_lag:]
+    final_fit = train_fit
     val_origins = rolling_origins(
         splits["validation"].index, panel.index, cfg.origins, cfg.horizon, max_lag
     )
