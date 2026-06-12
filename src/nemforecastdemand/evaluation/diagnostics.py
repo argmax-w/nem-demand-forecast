@@ -41,8 +41,13 @@ class ElboTrace:
             }
         ).set_index("step")
 
-    def converged(self, window: int = 20, tolerance: float = 1e-4) -> bool:
-        """Crude convergence check: relative ELBO drift over the last window."""
+    def converged(self, window: int = 20, tolerance: float = 1e-2) -> bool:
+        """Crude convergence check: relative ELBO drift over the last window.
+
+        The checkpoints are 64-particle estimates, so their noise floor sits
+        well above fractions of a percent; one percent drift between the
+        last two windows is the practical plateau for this estimator.
+        """
         if len(self.elbo) < 2 * window:
             return False
         recent = self.elbo[-window:].mean()

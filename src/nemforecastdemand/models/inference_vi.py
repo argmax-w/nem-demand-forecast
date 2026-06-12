@@ -70,11 +70,11 @@ class ViFit:
         return tree_to_float32({name: np.asarray(value) for name, value in samples.items()})
 
 
-def make_guide(kind: str, model_fn: Callable) -> autoguide.AutoGuide:
+def make_guide(kind: str, model_fn: Callable, overrides: dict | None = None) -> autoguide.AutoGuide:
     """Construct the surrogate family with a prior-median start."""
     if kind not in GUIDE_SETTINGS:
         raise ValueError(f"unknown guide kind {kind!r}, expected one of {GUIDE_KINDS}")
-    settings = GUIDE_SETTINGS[kind]
+    settings = {**GUIDE_SETTINGS[kind], **(overrides or {})}
     cls = autoguide.AutoNormal if kind == "meanfield" else autoguide.AutoMultivariateNormal
     return cls(
         model_fn,
@@ -105,6 +105,7 @@ def fit_advi(
     kind: str,
     vi: ViConfig,
     seed: int,
+    overrides: dict | None = None,
 ) -> ViFit:
     """Fit a surrogate by stochastic gradient ascent on the ELBO.
 
@@ -119,6 +120,10 @@ def fit_advi(
         Optimisation settings.
     seed
         PRNG seed; the evaluation stream is split from the training stream.
+    overrides
+        Optional per-call replacements for the guide's optimiser settings
+        (``lr_scale``, ``clip``, ``init_scale``), for geometries where the
+        shared defaults are too aggressive.
 
     Returns
     -------
@@ -126,8 +131,8 @@ def fit_advi(
         Fitted parameters, the ELBO decomposition trace and timings with
         compilation separated from optimisation.
     """
-    guide = make_guide(kind, model_fn)
-    settings = GUIDE_SETTINGS[kind]
+    guide = make_guide(kind, model_fn, overrides)
+    settings = {**GUIDE_SETTINGS[kind], **(overrides or {})}
     schedule = optax.exponential_decay(
         init_value=vi.learning_rate * settings["lr_scale"],
         transition_steps=max(vi.steps // 4, 1),

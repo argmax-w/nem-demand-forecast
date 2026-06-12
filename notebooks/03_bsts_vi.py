@@ -104,12 +104,20 @@ fig.suptitle("ELBO = energy + entropy, per optimisation step", y=1.03)
 save_figure(fig, "elbo_decomposition", cfg.paths.figures)
 plt.show()
 
+
+def plateau_drift(elbo: np.ndarray, window: int = 20) -> str:
+    """Relative ELBO drift between the last two checkpoint windows."""
+    recent = elbo[-window:].mean()
+    previous = elbo[-2 * window : -window].mean()
+    return f"{abs(recent - previous) / abs(previous):.2%}"
+
+
 pd.DataFrame(
     {
         kind: {
             "final ELBO": meta["final_elbo"],
             "final entropy": meta["final_entropy"],
-            "converged": meta["converged"],
+            "plateau drift, last 2k steps": plateau_drift(arrays["elbo"]),
             "fit seconds": meta["timings_seconds"]["fit_seconds"],
             "steps per second": meta["timings_seconds"]["steps_per_second"],
             "device": meta["device"],

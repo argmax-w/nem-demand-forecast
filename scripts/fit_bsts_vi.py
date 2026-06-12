@@ -66,8 +66,15 @@ def main() -> None:
     )
     perturbations = fit_perturbation_models(panel, splits["train"].index)
 
+    # The explicit-state geometry hands the full-rank guide a Cholesky
+    # factor of roughly fifteen million entries; at the shared learning
+    # rate the eight-particle gradient blows it apart within two hundred
+    # steps, so this model trains that family an order slower with a
+    # tighter clip and a smaller initial scale.
+    overrides = {"fullrank": {"lr_scale": 0.1, "clip": 0.5, "init_scale": 0.005}}
+
     for kind in args.guides:
-        fit = fit_advi(model_fn, kind, cfg.vi, seed=cfg.seed)
+        fit = fit_advi(model_fn, kind, cfg.vi, seed=cfg.seed, overrides=overrides.get(kind))
         print(
             f"{kind} on {fit.device}: {fit.timings['fit_seconds']:.0f}s "
             f"({fit.timings['steps_per_second']:.1f} steps/s), "
