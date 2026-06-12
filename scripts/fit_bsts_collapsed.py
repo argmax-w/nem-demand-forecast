@@ -20,8 +20,23 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
     parser.add_argument("--device", choices=["default", "cpu"], default="default")
     args = parser.parse_args()
+
+    from dataclasses import replace
+
+    from nemforecastdemand.config import load_config
+
+    cfg = load_config(args.config)
     if args.device == "cpu":
+        # The collapsed likelihood is a sequential scan, so vectorised
+        # chains run in lockstep on one or two cores. One XLA host device
+        # per chain lets the chains run in parallel across the package's
+        # cores instead, which is how a practitioner would use the CPU.
         os.environ["JAX_PLATFORMS"] = "cpu"
+        flags = os.environ.get("XLA_FLAGS", "")
+        os.environ["XLA_FLAGS"] = (
+            f"{flags} --xla_force_host_platform_device_count={cfg.nuts.chains}"
+        )
+        cfg = replace(cfg, nuts=replace(cfg.nuts, chain_method="parallel"))
 
     from functools import partial
 
@@ -29,7 +44,6 @@ def main() -> None:
     import numpy as np
     import pandas as pd
 
-    from nemforecastdemand.config import load_config
     from nemforecastdemand.data.loaders import load_splits
     from nemforecastdemand.models import bsts
     from nemforecastdemand.models.inference_mcmc import (
@@ -43,7 +57,6 @@ def main() -> None:
     from nemforecastdemand.splits import rolling_origins
     from nemforecastdemand.utils import save_artifact, timed
 
-    cfg = load_config(args.config)
     splits = load_splits(cfg.paths.processed)
     panel = pd.concat([splits["train"], splits["validation"], splits["test"]])
     max_lag = max(cfg.features.demand_lags)

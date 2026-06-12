@@ -174,6 +174,7 @@ def fit_nuts(
             "warmup": num_warmup,
             "samples": nuts.samples,
             "chains": nuts.chains,
+            "chain_method": nuts.chain_method,
             "target_accept": nuts.target_accept,
             "max_tree_depth": nuts.max_tree_depth,
             "warm_start": warm_start.source if warm_start else None,
