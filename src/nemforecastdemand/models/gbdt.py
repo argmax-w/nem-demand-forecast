@@ -107,6 +107,10 @@ class LightGbmQuantile(Forecaster):
             head.fit(train_design, train_y, **eval_kwargs)
             self._heads[level] = head
             self.best_iterations[level] = int(head.best_iteration_ or _LGBM_PARAMS["n_estimators"])
+            print(
+                f"  quantile {level:.3f}: {self.best_iterations[level]} trees",
+                flush=True,
+            )
         return self
 
     def forecast(

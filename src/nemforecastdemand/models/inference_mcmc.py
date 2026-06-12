@@ -88,6 +88,7 @@ def fit_nuts(
     seed: int,
     warmup: int | None = None,
     warm_start: WarmStart | None = None,
+    progress: bool = True,
 ) -> NutsRun:
     """Run NUTS, cold or warm started.
 
@@ -107,6 +108,11 @@ def fit_nuts(
         from draws of q, the inverse mass matrix is fixed to the surrogate
         covariance and mass adaptation is disabled. Step-size adaptation
         remains on either way.
+    progress
+        Show the sampler's progress bar. Vectorised chains share one bar.
+        The bar runs the iteration loop on the host instead of one fused
+        scan; the per-iteration dispatch overhead is the same on every
+        device, so timed comparisons remain like for like.
 
     Returns
     -------
@@ -134,7 +140,7 @@ def fit_nuts(
         num_samples=nuts.samples,
         num_chains=nuts.chains,
         chain_method=nuts.chain_method,
-        progress_bar=False,
+        progress_bar=progress,
     )
 
     timings: dict[str, float] = {}

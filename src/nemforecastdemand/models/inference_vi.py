@@ -162,6 +162,7 @@ def fit_advi(
             steps.append(step)
             elbos.append(float(checkpoint(rng_step, params)))
             entropies.append(float(_gaussian_entropy(params)))
+            print(f"  [{kind}] step {step}/{vi.steps}: elbo {elbos[-1]:,.0f}", flush=True)
     jax.block_until_ready(state)
     timings["fit_seconds"] = time.perf_counter() - start
     timings["steps_per_second"] = (vi.steps - 1) / timings["fit_seconds"]

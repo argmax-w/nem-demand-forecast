@@ -205,7 +205,7 @@ def run_variants(
         if multiplier > 0:
             variants[f"perturb_{multiplier:g}"] = []
 
-    for origin in origins:
+    for count, origin in enumerate(origins, start=1):
         index = horizon_index(origin, 48)
         variants["forecast"].append(forecaster.forecast(panel, origin, "forecast"))
         variants["actual"].append(forecaster.forecast(panel, origin, "actual"))
@@ -216,6 +216,8 @@ def run_variants(
             variants[f"perturb_{multiplier:g}"].append(
                 forecaster.forecast(panel, origin, "actual", overrides=overrides)
             )
+        if count % 25 == 0 or count == len(origins):
+            print(f"  forecasts: {count}/{len(origins)} origins", flush=True)
     return variants
 
 
