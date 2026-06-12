@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 from tests.conftest import make_panel
 
-from nemforecastdemand.data.loaders import load_split, load_splits, validate_panel
+from nemforecastdemand.data.loaders import load_panel, load_splits, validate_panel
 
 
 def test_valid_panel_passes(panel):
@@ -49,25 +49,47 @@ def test_negative_demand_rejected(panel):
         validate_panel(bad)
 
 
-def test_load_splits_round_trip(tmp_path):
-    full = make_panel("2025-06-01", days=10)
-    parts = {"train": full.iloc[:336], "validation": full.iloc[336:408], "test": full.iloc[408:]}
-    for name, frame in parts.items():
-        frame.to_parquet(tmp_path / f"{name}.parquet")
+def _write_processed(tmp_path, full, labels):
+    full.to_parquet(tmp_path / "panel.parquet")
+    pd.DataFrame({"split": pd.Series(labels, index=full.index)}).to_parquet(
+        tmp_path / "split_labels.parquet"
+    )
+
+
+def test_load_panel_round_trip(tmp_path):
+    full = make_panel("2024-09-01", days=10)
+    _write_processed(tmp_path, full, ["train"] * len(full))
+    pd.testing.assert_frame_equal(load_panel(tmp_path), full, check_freq=False)
+
+
+def test_load_splits_slices_panel_by_label(tmp_path):
+    # Train first half, then two disjoint evaluation windows (non-contiguous).
+    full = make_panel("2024-09-01", days=10)
+    labels = np.array(["none"] * len(full), dtype=object)
+    labels[: 5 * 48] = "train"
+    labels[6 * 48 : 7 * 48] = "validation"
+    labels[8 * 48 : 9 * 48] = "test"
+    _write_processed(tmp_path, full, labels)
     splits = load_splits(tmp_path)
-    assert len(splits["train"]) == 336
-    pd.testing.assert_frame_equal(splits["test"], parts["test"], check_freq=False)
+    assert len(splits["train"]) == 5 * 48
+    assert len(splits["validation"]) == 48
+    assert splits["train"].index[-1] < splits["validation"].index[0]
 
 
-def test_load_splits_rejects_gap(tmp_path):
-    full = make_panel("2025-06-01", days=10)
-    parts = {"train": full.iloc[:336], "validation": full.iloc[340:408], "test": full.iloc[408:]}
-    for name, frame in parts.items():
-        frame.to_parquet(tmp_path / f"{name}.parquet")
-    with pytest.raises(ValueError, match="contiguous"):
+def test_load_splits_rejects_train_overlapping_eval(tmp_path):
+    full = make_panel("2024-09-01", days=10)
+    labels = np.array(["none"] * len(full), dtype=object)
+    labels[: 8 * 48] = "train"  # train runs past the validation window
+    labels[6 * 48 : 7 * 48] = "validation"
+    labels[9 * 48 :] = "test"
+    _write_processed(tmp_path, full, labels)
+    with pytest.raises(ValueError, match="strictly precede"):
         load_splits(tmp_path)
 
 
-def test_unknown_split_name(tmp_path):
-    with pytest.raises(ValueError, match="unknown split"):
-        load_split("holdout", tmp_path)
+def test_validate_panel_allows_gaps_without_grid(tmp_path):
+    full = make_panel("2024-09-01", days=10)
+    block = full.iloc[list(range(48)) + list(range(96, 144))]  # a deliberate gap
+    validate_panel(block, "block", require_grid=False)
+    with pytest.raises(ValueError, match="grid"):
+        validate_panel(block, "block", require_grid=True)

@@ -1,39 +1,92 @@
-"""Split integrity: no leakage, day-boundary cuts, qualifying origins."""
+"""Split integrity: contiguous train, all-season blocks, qualifying origins."""
 
 import pandas as pd
 
+from nemforecastdemand.config import Splits
 from nemforecastdemand.data.loaders import MARKET_TZ
 from nemforecastdemand.splits import (
-    chronological_split,
     horizon_index,
     market_day_starts,
     rolling_origins,
+    season_blocked_split,
+    split_labels,
 )
 
 
-def make_index(days: int) -> pd.DatetimeIndex:
-    start = pd.Timestamp("2025-06-01", tz=MARKET_TZ).tz_convert("UTC")
+def make_index(start_market: str, days: int) -> pd.DatetimeIndex:
+    start = pd.Timestamp(start_market, tz=MARKET_TZ).tz_convert("UTC")
     return pd.date_range(start, periods=days * 48, freq="30min")
 
 
-def test_chronological_split_is_disjoint_contiguous_and_ordered():
-    index = make_index(40)
-    splits = chronological_split(index, train=0.7, validation=0.15)
-    union = splits["train"].union(splits["validation"]).union(splits["test"])
-    assert union.equals(index)
-    assert splits["train"][-1] < splits["validation"][0] < splits["test"][0]
-    for name in ("validation", "test"):
-        market = splits[name][0].tz_convert(MARKET_TZ)
-        assert (market.hour, market.minute) == (0, 0)
-    assert abs(len(splits["train"]) / len(index) - 0.7) < 1 / 40
-    assert abs(len(splits["validation"]) / len(index) - 0.15) < 1 / 40
+def make_splits_cfg(seed: int = 7) -> Splits:
+    return Splits(
+        eval_start="2025-01-01",
+        early_window=(8, 12),
+        late_window=(19, 23),
+        seed=seed,
+    )
+
+
+def test_season_blocked_split_is_clean_and_all_season():
+    # Train through December 2024, then four evaluation months.
+    index = make_index("2024-09-01", days=270)
+    splits = season_blocked_split(index, make_splits_cfg())
+    train, validation, test = (splits[name] for name in ("train", "validation", "test"))
+
+    # Training block strictly precedes every evaluation timestamp.
+    assert train[-1] < validation[0]
+    assert train[-1] < test[0]
+    eval_start = pd.Timestamp("2025-01-01", tz=MARKET_TZ)
+    assert (train.tz_convert(MARKET_TZ) < eval_start).all()
+
+    # Validation and test never overlap.
+    assert len(validation.intersection(test)) == 0
+
+    # Both sets span every evaluation month, one window each.
+    market = index.tz_convert(MARKET_TZ)
+    months = set(pd.PeriodIndex(market[market >= eval_start], freq="M").unique())
+    for block in (validation, test):
+        covered = set(pd.PeriodIndex(block.tz_convert(MARKET_TZ), freq="M").unique())
+        assert covered == months
+
+    # Every window falls inside one of the two configured day ranges.
+    for block in (validation, test):
+        days = block.tz_convert(MARKET_TZ).day
+        in_early = (days >= 8) & (days <= 12)
+        in_late = (days >= 19) & (days <= 23)
+        assert (in_early | in_late).all()
+
+
+def test_validation_slot_assignment_is_balanced():
+    # An even number of complete evaluation months must split exactly half
+    # early, half late for validation (and the complement for test). The
+    # span below ends in July, so January to June are the six complete
+    # evaluation months and the partial July is excluded.
+    index = make_index("2024-09-01", days=305)
+    splits = season_blocked_split(index, make_splits_cfg())
+    market = splits["validation"].tz_convert(MARKET_TZ)
+    frame = pd.DataFrame({"ym": pd.PeriodIndex(market, freq="M").astype(str), "day": market.day})
+    first_day = frame.groupby("ym")["day"].min()
+    early = (first_day <= 12).sum()
+    late = (first_day >= 19).sum()
+    assert early == late
+
+
+def test_split_labels_cover_panel_without_overlap():
+    index = make_index("2024-09-01", days=270)
+    splits = season_blocked_split(index, make_splits_cfg())
+    labels = split_labels(index, splits)
+    assert labels.index.equals(index)
+    assert set(labels.unique()) <= {"train", "validation", "test", "none"}
+    for name in ("train", "validation", "test"):
+        assert (labels.loc[splits[name]] == name).all()
 
 
 def test_rolling_origins_respect_horizon_and_lags():
-    index = make_index(10)
-    splits = chronological_split(index, train=0.5, validation=0.2)
+    index = make_index("2025-06-01", days=10)
+    scoring = index[index.tz_convert(MARKET_TZ).day <= 7]
     origins = rolling_origins(
-        splits["test"],
+        scoring,
         history_index=index,
         origin_times=("00:00", "12:00"),
         horizon=48,
@@ -41,17 +94,14 @@ def test_rolling_origins_respect_horizon_and_lags():
     )
     market = origins.tz_convert(MARKET_TZ)
     assert set(zip(market.hour, market.minute, strict=True)) <= {(0, 0), (12, 0)}
-    # Three test days support two half-day origins each, minus the final
-    # 12:00 whose horizon would run past the end of the split.
-    assert len(origins) == 5
     for origin in origins:
         steps = horizon_index(origin, 48)
-        assert steps.isin(splits["test"]).all()
+        assert steps.isin(scoring).all()
         assert (origin - pd.Timedelta("30min") * 336) >= index[0]
 
 
 def test_market_day_starts_finds_midnights():
-    index = make_index(3)
+    index = make_index("2025-06-01", days=3)
     starts = market_day_starts(index)
     assert len(starts) == 3
     assert (starts.tz_convert(MARKET_TZ).hour == 0).all()

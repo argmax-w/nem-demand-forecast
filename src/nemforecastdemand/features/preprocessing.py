@@ -80,16 +80,25 @@ def hampel_flags(series: pd.Series, window: int = 336, k: float = 8.0) -> pd.Ser
     return (series - median).abs() > threshold
 
 
-def interpolate_to_grid(hourly: pd.DataFrame, grid: pd.DatetimeIndex) -> pd.DataFrame:
+def interpolate_to_grid(
+    hourly: pd.DataFrame, grid: pd.DatetimeIndex, extrapolate: bool = True
+) -> pd.DataFrame:
     """Interpolate hourly weather onto the half-hourly grid.
 
     Time-based linear interpolation on the union of the two indices, then a
     reindex. Open-Meteo hourly radiation is a preceding-hour mean rather than
     an instantaneous value; treating it as instantaneous at the stamp is an
     approximation that is immaterial for regression features.
+
+    With ``extrapolate`` the leading and trailing edges are filled with the
+    nearest value (needed for the actuals, padded only a couple of days
+    beyond the window). For the forecasts it is left False so the period
+    before the forecast archive begins stays missing and is filled from
+    actuals downstream rather than back-extrapolated as a constant.
     """
     union = hourly.index.union(grid)
-    return hourly.reindex(union).interpolate(method="time", limit_direction="both").reindex(grid)
+    direction = "both" if extrapolate else "forward"
+    return hourly.reindex(union).interpolate(method="time", limit_direction=direction).reindex(grid)
 
 
 def build_panel(
@@ -143,7 +152,7 @@ def build_panel(
     fc = forecast.rename(columns=forecast_stems)
     gaps_before = fc.isna().sum()
     fc = fc.interpolate(method="time", limit=8)
-    fc_grid = interpolate_to_grid(fc, grid)
+    fc_grid = interpolate_to_grid(fc, grid, extrapolate=False)
     for column in fc_grid:
         report.weather_interpolated[column] = int(gaps_before.get(column, 0))
         remaining = fc_grid[column].isna()

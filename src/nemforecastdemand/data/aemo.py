@@ -1,20 +1,22 @@
-"""AEMO operational demand acquisition and parsing.
+"""AEMO regional demand acquisition and parsing.
 
-The series used everywhere in this project is operational demand, table
-``OPERATIONAL_DEMAND.ACTUAL``, column ``OPERATIONAL_DEMAND``, published in the
-NEMWeb "Operational Demand" ``ACTUAL_HH`` reports at half-hourly resolution.
-Operational demand (demand met by scheduled, semi-scheduled and significant
-non-scheduled generation) is not the same series as the ``TOTALDEMAND`` column
-of ``DISPATCHREGIONSUM`` that accessors such as NEMOSIS expose, and the
-OPERATIONAL_DEMAND package is absent from both NEMOSIS and the MMSDM monthly
-archives, so this module fetches the reports directly from NEMWeb.
+The target is NSW1 demand from AEMO's aggregated price-and-demand archive
+(the ``TOTALDEMAND`` column of ``DISPATCHREGIONSUM``, the regional demand met
+by scheduled, semi-scheduled and significant generation), published as
+monthly ``PRICE_AND_DEMAND_{YYYYMM}_{REGION}.csv`` files at five-minute
+dispatch resolution. This series is chosen for its depth: the archive reaches
+back several years, which is what lets the evaluation split cover every
+season in both validation and test without any look-ahead. The half-hourly
+``OPERATIONAL_DEMAND.ACTUAL`` reports on NEMWeb (parsed by the functions at
+the foot of this module) retain only about thirteen months and so cannot
+support an all-season split; they remain available as an alternative source.
 
-NEMWeb retains roughly thirteen months of ``ACTUAL_HH`` archives as weekly
-zips, each holding one inner zip per half hour. AEMO stamps intervals with
-their ending time in market time (AEST, UTC+10, no daylight saving). The
-project stores everything in UTC with period-start timestamps, so the parser
-shifts stamps back by thirty minutes and converts the fixed-offset market
-time to UTC on the way out. Plots convert back to AEST at the display layer.
+AEMO stamps dispatch intervals with their ending time in market time (AEST,
+UTC+10, no daylight saving). The project stores everything in UTC with
+period-start timestamps: five-minute readings are averaged into the half hour
+whose ending boundary they fall under, the ending stamp is shifted back by
+thirty minutes to a period start and the fixed-offset market time is then
+converted to UTC. Plots convert back to AEST at the display layer.
 """
 
 from __future__ import annotations
@@ -28,8 +30,86 @@ from pathlib import Path
 import polars as pl
 import requests
 
-ARCHIVE_URL = "https://nemweb.com.au/Reports/ARCHIVE/Operational_Demand/ACTUAL_HH/"
 MARKET_TZ = "Australia/Brisbane"
+PRICE_DEMAND_URL = (
+    "https://aemo.com.au/aemo/data/nem/priceanddemand/PRICE_AND_DEMAND_{ym}_{region}.csv"
+)
+
+
+def download_price_demand(start: date, end: date, region: str, raw_dir: Path) -> list[Path]:
+    """Download the monthly price-and-demand CSVs spanning the window.
+
+    Files already present are left untouched, so reruns are cheap. The
+    window is widened by one month on each side so the half-hourly grid has
+    no edge effects after timezone conversion.
+    """
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    months = []
+    cursor = date(start.year, start.month, 1) - timedelta(days=1)
+    cursor = date(cursor.year, cursor.month, 1)
+    last = date(end.year, end.month, 1) + timedelta(days=32)
+    last = date(last.year, last.month, 1)
+    while cursor <= last:
+        months.append(f"{cursor.year}{cursor.month:02d}")
+        nxt = cursor + timedelta(days=32)
+        cursor = date(nxt.year, nxt.month, 1)
+
+    paths = []
+    for ym in months:
+        path = raw_dir / f"PRICE_AND_DEMAND_{ym}_{region}.csv"
+        if not path.exists() or path.stat().st_size == 0:
+            response = requests.get(PRICE_DEMAND_URL.format(ym=ym, region=region), timeout=120)
+            response.raise_for_status()
+            path.write_bytes(response.content)
+        paths.append(path)
+    return paths
+
+
+def load_demand_csv(start: date, end: date, region: str, raw_dir: Path) -> pl.DataFrame:
+    """Half-hourly NSW1 demand from the price-and-demand CSVs, UTC period start.
+
+    Parameters
+    ----------
+    start, end
+        Inclusive period-start window in market time.
+    region
+        NEM region identifier, for example ``NSW1``.
+    raw_dir
+        Directory holding (or receiving) the monthly CSVs.
+
+    Returns
+    -------
+    polars.DataFrame
+        Columns ``ts`` (UTC period start, strictly increasing) and
+        ``demand_mw``, the mean of the five-minute ``TOTALDEMAND`` readings
+        in each half hour.
+    """
+    paths = download_price_demand(start, end, region, raw_dir)
+    lower = pl.datetime(start.year, start.month, start.day)
+    upper = pl.datetime(end.year, end.month, end.day) + pl.duration(days=1)
+    frames = [pl.read_csv(path, schema_overrides={"SETTLEMENTDATE": pl.String}) for path in paths]
+    return (
+        pl.concat(frames)
+        .filter(pl.col("REGION") == region)
+        .with_columns(settlement=pl.col("SETTLEMENTDATE").str.to_datetime("%Y/%m/%d %H:%M:%S"))
+        .with_columns(
+            # Five-minute stamps are period ending; the containing half hour
+            # ends at the next 30-minute boundary (a stamp already on a
+            # boundary stays put).
+            interval_end=pl.col("settlement").dt.offset_by("-1s").dt.truncate("30m")
+            + pl.duration(minutes=30)
+        )
+        .group_by("interval_end")
+        .agg(demand_mw=pl.col("TOTALDEMAND").mean())
+        .with_columns(ts=pl.col("interval_end") - pl.duration(minutes=30))
+        .filter((pl.col("ts") >= lower) & (pl.col("ts") < upper))
+        .with_columns(ts=pl.col("ts").dt.replace_time_zone(MARKET_TZ).dt.convert_time_zone("UTC"))
+        .select("ts", "demand_mw")
+        .sort("ts")
+    )
+
+
+ARCHIVE_URL = "https://nemweb.com.au/Reports/ARCHIVE/Operational_Demand/ACTUAL_HH/"
 _HEADERS = {"User-Agent": "nem-demand-forecast (github.com/argmax-w/nem-demand-forecast)"}
 _ZIP_NAME = re.compile(r"PUBLIC_ACTUAL_OPERATIONAL_DEMAND_HH_(\d{8})\.zip", re.IGNORECASE)
 _DATA_ROW_PREFIX = b"D,OPERATIONAL_DEMAND,ACTUAL"

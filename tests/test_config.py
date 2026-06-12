@@ -16,10 +16,11 @@ def test_default_config_loads_and_is_typed():
     assert cfg.paths.processed.is_absolute()
 
 
-def test_split_fractions_sum_to_one():
+def test_split_windows_are_disjoint_day_ranges():
     cfg = load_config()
-    total = cfg.splits.train + cfg.splits.validation + cfg.splits.test
-    assert abs(total - 1.0) < 1e-9
+    early, late = cfg.splits.early_window, cfg.splits.late_window
+    assert early[0] <= early[1] < late[0] <= late[1]
+    assert isinstance(cfg.splits.seed, int)
 
 
 def test_timed_records_elapsed():

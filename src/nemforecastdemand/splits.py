@@ -1,10 +1,14 @@
-"""Chronological splits and rolling forecast origins.
+"""Season-blocked splits and rolling forecast origins.
 
-Splits are cut at market-day boundaries with no shuffling, so train always
-precedes validation precedes test and no half hour appears twice. Forecast
-origins are the configured market-clock issue times (00:00 and 12:00 AEST);
-each origin forecasts the next 48 half hours, and an origin only qualifies
-when its full horizon and its longest demand lag both lie inside the data.
+Everything strictly before the evaluation start is one contiguous training
+block, so the time-series likelihoods fit on an unbroken series and no
+fitting target ever sits after an evaluation point. The evaluation year is
+carved into monthly pairs of fixed day windows, and a balanced seeded draw
+sends one window of each month to validation and the other to test, so both
+sets span every season and share the same position-in-month distribution.
+Forecast origins are the configured market-clock issue times (00:00 and
+12:00 AEST); each forecasts the next 48 half hours, and an origin qualifies
+only when its full horizon and its longest demand lag lie inside the data.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from nemforecastdemand.config import Splits
 from nemforecastdemand.data.loaders import MARKET_TZ, SPLIT_NAMES
 
 
@@ -21,39 +26,79 @@ def market_day_starts(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     return index[(market.hour == 0) & (market.minute == 0)]
 
 
-def chronological_split(
-    index: pd.DatetimeIndex,
-    train: float,
-    validation: float,
-) -> dict[str, pd.DatetimeIndex]:
-    """Split a half-hourly index chronologically at market-day boundaries.
+def _eval_months(market: pd.DatetimeIndex, eval_start: pd.Timestamp) -> list[tuple[int, int]]:
+    """Distinct (year, month) pairs in the evaluation period, in order."""
+    after = market[market >= eval_start]
+    periods = pd.PeriodIndex(after, freq="M").unique()
+    return [(p.year, p.month) for p in periods]
+
+
+def season_blocked_split(index: pd.DatetimeIndex, splits: Splits) -> dict[str, pd.DatetimeIndex]:
+    """Split a half-hourly index into a training block and monthly eval blocks.
 
     Parameters
     ----------
     index
         The full UTC half-hourly grid.
-    train, validation
-        Fractions of the window; the remainder is the test set. Cut points
-        snap to the nearest market-day boundary so every split starts at
-        00:00 market time.
+    splits
+        Split configuration: evaluation start, the two day windows and the
+        seed for the balanced validation/test assignment.
 
     Returns
     -------
     dict
-        ``{"train": ..., "validation": ..., "test": ...}`` index slices,
-        disjoint and contiguous.
+        ``{"train": ..., "validation": ..., "test": ...}`` index slices.
+        ``train`` is contiguous; ``validation`` and ``test`` are unions of
+        disjoint monthly windows. Evaluation-year days outside the windows
+        belong to no split.
     """
-    days = market_day_starts(index)
-    n_days = len(days)
-    train_days = round(train * n_days)
-    validation_days = round(validation * n_days)
-    first_validation = days[train_days]
-    first_test = days[train_days + validation_days]
+    market = index.tz_convert(MARKET_TZ)
+    eval_start = pd.Timestamp(splits.eval_start, tz=MARKET_TZ)
+    train_mask = market < eval_start
+
+    early_lo, early_hi = splits.early_window
+    late_lo, late_hi = splits.late_window
+    day = market.day
+    # Only months whose data fully covers both windows take part, so a
+    # partial month at the end of the record is left out rather than
+    # unbalancing the validation/test assignment.
+    months = [
+        (year, month)
+        for (year, month) in _eval_months(market, eval_start)
+        if ((market.year == year) & (market.month == month) & (day == early_lo)).any()
+        and ((market.year == year) & (market.month == month) & (day == late_hi)).any()
+    ]
+    # Balanced assignment: validation takes the early window in exactly half
+    # the months (rounded down) and the late window in the rest, so neither
+    # set is biased towards the start or the end of the month.
+    rng = np.random.default_rng(splits.seed)
+    val_early = np.zeros(len(months), dtype=bool)
+    val_early[: len(months) // 2] = True
+    val_early = rng.permutation(val_early)
+
+    val_mask = np.zeros(len(index), dtype=bool)
+    test_mask = np.zeros(len(index), dtype=bool)
+    for (year, month), v_early in zip(months, val_early, strict=True):
+        in_month = (market.year == year) & (market.month == month)
+        early = in_month & (day >= early_lo) & (day <= early_hi)
+        late = in_month & (day >= late_lo) & (day <= late_hi)
+        val_window, test_window = (early, late) if v_early else (late, early)
+        val_mask |= np.asarray(val_window)
+        test_mask |= np.asarray(test_window)
+
     return {
-        "train": index[index < first_validation],
-        "validation": index[(index >= first_validation) & (index < first_test)],
-        "test": index[index >= first_test],
+        "train": index[train_mask],
+        "validation": index[val_mask],
+        "test": index[test_mask],
     }
+
+
+def split_labels(index: pd.DatetimeIndex, splits: dict[str, pd.DatetimeIndex]) -> pd.Series:
+    """Per-timestamp split label, ``none`` for evaluation days in no window."""
+    labels = pd.Series("none", index=index, dtype="object")
+    for name in SPLIT_NAMES:
+        labels.loc[splits[name]] = name
+    return labels
 
 
 def rolling_origins(

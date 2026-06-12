@@ -1,9 +1,9 @@
-"""Download NSW1 operational demand actuals from NEMWeb.
+"""Download NSW1 demand from AEMO's aggregated price-and-demand archive.
 
-Fetches the weekly ``ACTUAL_HH`` archive zips covering the configured window
-into ``data/raw/aemo`` and writes the parsed half-hourly series to
-``data/interim/demand.parquet`` so later steps do not re-read thousands of
-inner zips.
+Fetches the monthly ``PRICE_AND_DEMAND_{YYYYMM}_NSW1.csv`` files covering the
+configured window into ``data/raw/demand_csv`` and writes the parsed
+half-hourly series to ``data/interim/demand.parquet`` so later steps do not
+re-read the five-minute CSVs.
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ def main() -> None:
     start = date.fromisoformat(cfg.window.start)
     end = date.fromisoformat(cfg.window.end)
 
-    demand = aemo.load_demand(start, end, cfg.region, cfg.paths.raw / "aemo")
+    demand = aemo.load_demand_csv(start, end, cfg.region, cfg.paths.raw / "demand_csv")
     cfg.paths.interim.mkdir(parents=True, exist_ok=True)
     out = cfg.paths.interim / "demand.parquet"
     demand.write_parquet(out)
     print(
-        f"{cfg.region} operational demand: {demand.height} half hours, "
+        f"{cfg.region} demand: {demand.height} half hours, "
         f"{demand['ts'].min()} to {demand['ts'].max()} -> {out}"
     )
 

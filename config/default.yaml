@@ -20,13 +20,19 @@ grid_point:
 # by archive depth: NEMWeb retains roughly thirteen months of half-hourly
 # operational demand actuals, which binds before the weather forecast archive.
 window:
-  start: "2025-05-18"
+  start: "2023-05-18"
   end: "2026-05-29"
 
 splits:
-  train: 0.70
-  validation: 0.15
-  test: 0.15
+  # Everything before eval_start (market time) is the contiguous training
+  # block. Each month of the evaluation year contributes an early and a
+  # late five-day window; a balanced seeded draw sends one to validation
+  # and the other to test, so both span all twelve months with no fixed
+  # position-in-month offset and no overlap with training.
+  eval_start: "2025-06-01"
+  early_window: [8, 12] # inclusive market-day range, first window of each month
+  late_window: [19, 23] # inclusive market-day range, second window of each month
+  seed: 20260613
 
 demand:
   source: nemweb # nemosis | nemweb

@@ -35,11 +35,19 @@ class Window:
 
 @dataclass(frozen=True)
 class Splits:
-    """Chronological train, validation and test fractions."""
+    """Season-blocked split with an all-season validation and test.
 
-    train: float
-    validation: float
-    test: float
+    Everything strictly before ``eval_start`` (market time) is the
+    contiguous training block. Each whole month of the evaluation year
+    contributes two fixed day windows; a balanced seeded assignment sends
+    one window to validation and the other to test, so both sets span every
+    month with no fixed position-in-month offset.
+    """
+
+    eval_start: str
+    early_window: tuple[int, int]
+    late_window: tuple[int, int]
+    seed: int
 
 
 @dataclass(frozen=True)
@@ -254,7 +262,12 @@ def load_config(path: str | Path | None = None) -> Config:
         origins=tuple(raw["origins"]),
         grid_point=GridPoint(**raw["grid_point"]),
         window=Window(**raw["window"]),
-        splits=Splits(**raw["splits"]),
+        splits=Splits(
+            eval_start=raw["splits"]["eval_start"],
+            early_window=tuple(raw["splits"]["early_window"]),
+            late_window=tuple(raw["splits"]["late_window"]),
+            seed=int(raw["splits"]["seed"]),
+        ),
         demand=DemandConfig(**raw["demand"]),
         weather=WeatherConfig(
             actuals_model=raw["weather"]["actuals_model"],
