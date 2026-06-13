@@ -35,7 +35,7 @@ def main() -> None:
     from nemforecastdemand.config import load_config
     from nemforecastdemand.data.loaders import load_panel, load_splits
     from nemforecastdemand.models import bsts, hsgp
-    from nemforecastdemand.models.inference_mcmc import fit_nuts, flatten_chains, warm_start_from_vi
+    from nemforecastdemand.models.inference_mcmc import fit_nuts, warm_start_from_vi
     from nemforecastdemand.models.inference_vi import fit_advi
     from nemforecastdemand.models.predict import (
         fit_perturbation_models,
@@ -86,6 +86,15 @@ def main() -> None:
     predict_sites = ("rho", "beta", "gamma0", "gamma")
     save_sites = hsgp.GP_HYPER_SITES
 
+    # The GP variant is reported from full-rank ADVI. Unlike the plain AR(1)
+    # model, whose warm-started NUTS reference mixes cleanly, the GP
+    # posterior is multimodal: the kernel amplitude and the hundred-odd basis
+    # weights form a funnel, and warm-started chains settle in distinct modes
+    # (split R-hat in the single digits). The full-rank surrogate finds one
+    # coherent mode and sidesteps the issue, which is the same inference-
+    # geometry lesson the rest of the project turns on. A NUTS attempt is
+    # still run so the notebook can show the multimodality, but its draws are
+    # not used for prediction.
     vi_fits = {}
     for kind in ("meanfield", "fullrank"):
         fit = fit_advi(model_fn, kind, cfg.vi, seed=cfg.seed)
@@ -96,6 +105,7 @@ def main() -> None:
             flush=True,
         )
         draws = fit.posterior_draws(model_fn, seed=cfg.seed + 10, n_draws=cfg.vi.posterior_draws)
+        timings = dict(fit.timings)
         arrays = {
             "elbo_steps": fit.trace.steps,
             "elbo": fit.trace.elbo,
@@ -104,77 +114,53 @@ def main() -> None:
         }
         for name in save_sites:
             arrays[f"draw_{name}"] = np.asarray(draws[name])
-        save_artifact(
-            cfg.paths.artifacts / f"bsts_hsgp_vi_{kind}",
-            arrays,
-            {
-                "guide": kind,
-                "device": fit.device,
-                "timings_seconds": dict(fit.timings),
-                "final_elbo": float(fit.trace.elbo[-1]),
-                "gp_settings": {
-                    "time_harmonics": args.time_harmonics,
-                    "temp_basis": args.temp_basis,
-                },
-                "fit_window": [str(fit_index[0]), str(fit_index[-1])],
-            },
-        )
+        meta = {
+            "guide": kind,
+            "device": fit.device,
+            "timings_seconds": timings,
+            "final_elbo": float(fit.trace.elbo[-1]),
+            "gp_settings": {"time_harmonics": args.time_harmonics, "temp_basis": args.temp_basis},
+            "fit_window": [str(fit_index[0]), str(fit_index[-1])],
+        }
+        # The full-rank fit carries the predictions for the comparison.
+        if kind == "fullrank":
+            thinned = {name: jnp.asarray(draws[name]) for name in predict_sites}
+            with timed("predict_seconds", timings):
+                variants, y_true = predict_variants_innovations(
+                    thinned, inputs, panel, cfg, test_origins, perturbations
+                )
+            arrays["origins_test"] = test_origins.asi8
+            arrays["y_test"] = y_true
+            for name, paths in variants.items():
+                arrays[f"{name}_paths"] = paths
+        save_artifact(cfg.paths.artifacts / f"bsts_hsgp_vi_{kind}", arrays, meta)
+
+    # Document the NUTS multimodality without using it for prediction.
+    from dataclasses import replace as dc_replace
 
     reference_warmup = (
         args.reference_warmup if args.reference_warmup is not None else cfg.nuts.warmup
     )
-    # Positions-only warm start: the guide places the chains in the right
-    # basin (cold chains inherit the AR model's degenerate modes), but the
-    # mass matrix is left to adapt because the guide covariance cannot
-    # represent the funnel between the kernel hyperparameters and the
-    # weights, and freezing it caps the attainable mixing.
-    from dataclasses import replace as dc_replace
-
     warm = warm_start_from_vi(vi_fits["fullrank"], cfg.nuts.chains, seed=cfg.seed + 20)
     warm = dc_replace(warm, freeze_mass=False)
     run = fit_nuts(model_fn, cfg.nuts, seed=cfg.seed + 30, warmup=reference_warmup, warm_start=warm)
     summary = run.summary().reset_index()
     print(
-        f"hsgp warm reference on {run.device}: "
-        f"warmup {run.timings['warmup_seconds']:.0f}s, "
-        f"sampling {run.timings['sample_seconds']:.0f}s, "
-        f"max rhat {summary['max_rhat'].max():.4f}",
+        f"hsgp NUTS (diagnostic, multimodal) on {run.device}: "
+        f"max rhat {summary['max_rhat'].max():.4f}, "
+        f"min bulk ESS {summary['min_bulk_ess'].min():.0f}",
         flush=True,
     )
-
-    draws = flatten_chains(run.posterior)
-    keep = max(draws["rho"].shape[0] // cfg.vi.posterior_draws, 1)
-    thinned = {name: jnp.asarray(draws[name][::keep]) for name in predict_sites}
-    timings = dict(run.timings)
-    with timed("predict_seconds", timings):
-        variants, y_true = predict_variants_innovations(
-            thinned, inputs, panel, cfg, test_origins, perturbations
-        )
-    arrays = {"origins_test": test_origins.asi8, "y_test": y_true}
-    for name, paths in variants.items():
-        arrays[f"{name}_paths"] = paths
-    for name in save_sites:
-        arrays[f"post_{name}"] = np.asarray(draws[name])
-    health = run.health(cfg.nuts.max_tree_depth).reset_index()
     save_artifact(
-        cfg.paths.artifacts / "bsts_hsgp_nuts_reference",
-        arrays,
+        cfg.paths.artifacts / "bsts_hsgp_nuts_diagnostic",
+        {f"post_{name}": np.asarray(run.posterior[name]) for name in predict_sites},
         {
             "device": run.device,
-            "timings_seconds": timings,
-            "settings": run.settings,
+            "timings_seconds": dict(run.timings),
             "site_summary": summary.to_dict("records"),
-            "min_bulk_ess": float(summary["min_bulk_ess"].min()),
             "max_rhat": float(summary["max_rhat"].max()),
-            "total_divergences": int(health["divergences"].sum()),
-            "advi_seconds": vi_fits["fullrank"].timings["fit_seconds"],
-            "advi_kind": "fullrank",
-            "reduced_warmup": reference_warmup,
-            "gp_settings": {
-                "time_harmonics": args.time_harmonics,
-                "temp_basis": args.temp_basis,
-            },
-            "fit_window": [str(fit_index[0]), str(fit_index[-1])],
+            "min_bulk_ess": float(summary["min_bulk_ess"].min()),
+            "note": "multimodal; reported for diagnosis only, not used for prediction",
         },
     )
     print("hsgp: artifacts written", flush=True)

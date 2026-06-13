@@ -72,9 +72,11 @@ ar_vi = {
     k: load_artifact(cfg.paths.artifacts / f"bsts_innovations_vi_{k}")
     for k in ("meanfield", "fullrank")
 }
-hsgp_stem = cfg.paths.artifacts / "bsts_hsgp_nuts_reference"
+hsgp_stem = cfg.paths.artifacts / "bsts_hsgp_vi_fullrank"
 hsgp, hsgp_meta = (
-    load_artifact(hsgp_stem) if hsgp_stem.with_suffix(".npz").exists() else (None, None)
+    load_artifact(hsgp_stem)
+    if (hsgp_stem.with_suffix(".npz").exists() and "forecast_paths" in np.load(hsgp_stem.with_suffix(".npz")))
+    else (None, None)
 )
 test_origins = rolling_origins(
     splits["test"].index, panel.index, cfg.origins, cfg.horizon, max(cfg.features.demand_lags)
@@ -478,11 +480,8 @@ compute_rows = {
 }
 if hsgp is not None:
     compute_rows["Bayesian AR(1) + GP surface"] = {
-        "fit (s)": hsgp_meta["advi_seconds"]
-        + hsgp_meta["timings_seconds"]["warmup_seconds"]
-        + hsgp_meta["timings_seconds"]["sample_seconds"],
+        "fit (s)": hsgp_meta["timings_seconds"]["fit_seconds"],
         "forecast all origins (s)": hsgp_meta["timings_seconds"]["predict_seconds"],
-        "min bulk ESS": hsgp_meta["min_bulk_ess"],
     }
 compute = pd.DataFrame(compute_rows).T
 compute.round(1)
