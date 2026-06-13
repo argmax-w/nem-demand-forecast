@@ -64,6 +64,15 @@ price its heteroskedastic variance head separately.
    coverage, PIT and the energy score over whole 48-step paths; paired
    bootstrap significance; a weather-degradation sweep; the hardest day;
    the compute bill.
+5. **Head to head** (notebook 06). The two best models, the Bayesian
+   AR(1) with the GP surface and LightGBM, win on different things.
+   LightGBM has the lower marginal CRPS and an operationally simpler
+   deterministic fit; the Bayesian model is sharper at short lead and is
+   the only one of the two that gives coherent 48-step scenarios (the
+   energy total, the intra-day ramp), a full density and tail
+   probabilities, and a decomposition of predictive variance into
+   reducible and irreducible parts. Each claim is demonstrated, with the
+   compute and calibration cost of each measured both ways.
 
 ## Results
 
@@ -101,7 +110,7 @@ origin the Bayesian model is the sharpest in the field.
   scores, calibration, sampler diagnostics), `splits.py`, `plotting.py`.
 - `scripts/`: download, build and fit entry points; every fit writes
   `artifacts/{name}.npz` plus `.json` metadata that the notebooks read.
-- `notebooks/`: the five-notebook narrative listed above.
+- `notebooks/`: the six-notebook narrative listed above.
 - `tests/`: scoring rules (sample CRPS verified against the analytic
   Gaussian), features, splits, loaders, the innovations likelihood
   (verified against a hand computation) and a leakage audit: training
