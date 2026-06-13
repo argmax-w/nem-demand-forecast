@@ -113,7 +113,6 @@ plt.show()
 # barely supports. They are local traps, not competing explanations.
 
 # %%
-from functools import partial
 
 import jax.numpy as jnp
 from numpyro.infer.util import log_density
