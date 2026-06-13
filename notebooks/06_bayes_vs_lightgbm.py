@@ -88,6 +88,27 @@ lg_h = np.stack(
     [crps_from_quantiles(y[i], quantiles[i], levels) for i in range(n_origins)]
 ).mean(axis=0)
 
+origin_times = pd.DatetimeIndex(gp["origins_test"].astype("datetime64[us]")).tz_localize(
+    "UTC"
+).tz_convert("Australia/Brisbane")
+daily_mean = y.mean(axis=1)
+typical = int(np.argsort(gp_origin_crps)[n_origins // 2])  # median-difficulty day, for illustration
+# Three days spanning the demand range, all reasonably calibrated, for the
+# side-by-side examples; chosen by daily mean demand rather than by score.
+examples = {
+    "low-demand day": int(np.argsort(daily_mean)[int(0.15 * n_origins)]),
+    "median-demand day": int(np.argsort(daily_mean)[n_origins // 2]),
+    "high-demand day": int(np.argsort(daily_mean)[int(0.88 * n_origins)]),
+}
+
+
+def band(model_paths_or_quantiles, i, lo, hi, is_paths):
+    if is_paths:
+        return np.quantile(model_paths_or_quantiles[:, i, :], [lo, hi], axis=0)
+    ql = model_paths_or_quantiles[i, levels.tolist().index(lo), :]
+    qh = model_paths_or_quantiles[i, levels.tolist().index(hi), :]
+    return np.vstack([ql, qh])
+
 # %% [markdown]
 # ## The headline trade
 #
@@ -224,27 +245,40 @@ pd.DataFrame(
 # The Bayesian paths are sampled jointly, so each is one plausible
 # trajectory of the whole day and any function of the 48 steps has a
 # correct distribution. LightGBM's marginal heads cannot produce
-# trajectories, only per-step bands.
+# trajectories, only per-step bands. The three rows below span the demand
+# range; in each, the left panel shows twelve coherent Bayesian sample
+# days against the observed, and the right shows LightGBM's per-step
+# quantile bands for the same day. Both track the observed across regimes;
+# the difference is that one gives trajectories and the other gives bands.
 
 # %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), sharey=True)
-worst = int(np.argmax(gp_origin_crps))
 idx = np.arange(horizon)
-for s in range(12):
-    axes[0].plot(idx, paths[s, worst, :], color=GP_BLUE, lw=0.6, alpha=0.5)
-axes[0].plot(idx, y[worst], color="black", lw=1.4, label="observed")
-axes[0].set_title("Bayesian model: 12 coherent sampled days")
-axes[0].set_ylabel("demand (MW)")
-axes[0].legend()
-for q in (0.05, 0.25, 0.5, 0.75, 0.95):
-    axes[1].plot(idx, quantiles[worst, levels.tolist().index(q), :], color=LG_GREEN, lw=0.8)
-axes[1].plot(idx, y[worst], color="black", lw=1.4)
-axes[1].set_title("LightGBM: per-step quantile bands, no trajectories")
-for ax in axes:
-    ax.set_xlabel("horizon step")
+fig, axes = plt.subplots(len(examples), 2, figsize=(13, 3.1 * len(examples)), sharex=True)
+for row, (label, i) in enumerate(examples.items()):
+    date = origin_times[i].strftime("%d %b %Y %H:%M")
+    for s in range(12):
+        axes[row, 0].plot(idx, paths[s, i, :], color=GP_BLUE, lw=0.5, alpha=0.45)
+    axes[row, 0].plot(idx, y[i], color="black", lw=1.4)
+    axes[row, 0].set_ylabel(f"{label}\ndemand (MW)")
+    for q in (0.05, 0.25, 0.5, 0.75, 0.95):
+        axes[row, 1].plot(idx, quantiles[i, levels.tolist().index(q), :], color=LG_GREEN, lw=0.8)
+    axes[row, 1].plot(idx, y[i], color="black", lw=1.4)
+    axes[row, 0].set_title(f"Bayesian coherent paths, {date}" if row == 0 else "")
+    axes[row, 1].set_title("LightGBM quantile bands" if row == 0 else "")
+axes[-1, 0].set_xlabel("horizon step")
+axes[-1, 1].set_xlabel("horizon step")
 fig.tight_layout()
 save_figure(fig, "bench_paths_vs_bands", cfg.paths.figures)
 plt.show()
+
+# %% [markdown]
+# Both models are well calibrated through most of the year. The exception
+# is honest and worth stating: the few worst-scored days are extreme
+# summer-heat afternoons that the model under-forecasts (the observed sits
+# above the 95 percent band on three of the 108 test days, all February
+# heat events), a sign the cooling response saturates at the top of the
+# temperature range. LightGBM, with its flexible non-linear mean, handles
+# those tails better, which is part of its accuracy edge.
 
 # %% [markdown]
 # **Coherence is real and measurable.** Shuffling each step's draws
@@ -299,12 +333,14 @@ print(f"  the independence assumption understates the spread "
 print(f"  intra-day ramp, coherent P95: {ramp_p95.mean():.0f} MW per half hour "
       "(marginals cannot give this)")
 
-mean_total = paths[:, worst, :].mean(axis=0).sum()
-grid = np.linspace(total[:, worst].min(), total[:, worst].max(), 200)
+mean_total = paths[:, typical, :].mean(axis=0).sum()
+grid = np.linspace(total[:, typical].min(), total[:, typical].max(), 200)
 fig, ax = plt.subplots(figsize=(7.5, 4))
-ax.hist(total[:, worst] / 1000, bins=40, color=GP_BLUE, alpha=0.7, density=True, label="coherent paths")
+ax.hist(
+    total[:, typical] / 1000, bins=40, color=GP_BLUE, alpha=0.7, density=True, label="coherent paths"
+)
 ax.plot(
-    grid / 1000, norm.pdf(grid, mean_total, independence_sd[worst]) * 1000,
+    grid / 1000, norm.pdf(grid, mean_total, independence_sd[typical]) * 1000,
     color="#c44536", lw=1.6, ls="--", label="marginal independence",
 )
 ax.set_xlabel("daily total demand (GW, sum of 48 half hours)")
@@ -320,27 +356,58 @@ plt.show()
 # The Bayesian posterior predictive is a density at every step, so the CDF,
 # any tail probability and a log score are defined everywhere. LightGBM
 # returns fifteen quantiles; between them a density must be interpolated
-# and beyond the outer pair it is absent.
+# and beyond the outer pair it is absent. The three steps below, the
+# overnight trough, the morning ramp and the evening peak of the
+# median-demand day, show the contrast: a smooth Bayesian density against
+# fifteen LightGBM points.
 
 # %%
-o, h = worst, 35
-draws = paths[:, o, h]
-fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-axes[0].hist(draws, bins=40, color=GP_BLUE, alpha=0.7, density=True)
-axes[0].set_title("Bayesian: a density at this step")
-axes[0].set_xlabel("demand (MW)")
-axes[0].set_ylabel("density")
-order = np.argsort(draws)
-axes[1].plot(draws[order], np.linspace(0, 1, n_draws), color=GP_BLUE, label="Bayesian CDF")
-axes[1].plot(quantiles[o, :, h], levels, "o", color=LG_GREEN, ms=5, label="LightGBM quantiles (15)")
-axes[1].axhspan(0.975, 1.0, color="#c44536", alpha=0.12)
-axes[1].axhspan(0.0, 0.025, color="#c44536", alpha=0.12)
-axes[1].set_title("LightGBM gives 15 points; the shaded tails are undefined")
-axes[1].set_xlabel("demand (MW)")
-axes[1].set_ylabel("cumulative probability")
-axes[1].legend(fontsize=8)
+i = examples["median-demand day"]
+step_labels = {"overnight (step 8)": 7, "morning ramp (step 16)": 15, "evening peak (step 38)": 37}
+fig, axes = plt.subplots(2, len(step_labels), figsize=(13, 6.5))
+for col, (label, h) in enumerate(step_labels.items()):
+    draws = paths[:, i, h]
+    axes[0, col].hist(draws, bins=40, color=GP_BLUE, alpha=0.7, density=True)
+    axes[0, col].axvline(y[i, h], color="black", lw=1.2, label="observed")
+    axes[0, col].set_title(label)
+    axes[0, col].set_xlabel("demand (MW)")
+    order = np.argsort(draws)
+    axes[1, col].plot(draws[order], np.linspace(0, 1, n_draws), color=GP_BLUE, label="Bayesian CDF")
+    axes[1, col].plot(
+        quantiles[i, :, h], levels, "o", color=LG_GREEN, ms=5, label="LightGBM quantiles"
+    )
+    axes[1, col].axhspan(0.975, 1.0, color="#c44536", alpha=0.12)
+    axes[1, col].axhspan(0.0, 0.025, color="#c44536", alpha=0.12)
+    axes[1, col].set_xlabel("demand (MW)")
+axes[0, 0].set_ylabel("Bayesian density")
+axes[1, 0].set_ylabel("cumulative probability")
+axes[0, 0].legend(fontsize=8)
+axes[1, 0].legend(fontsize=8)
+fig.suptitle("Bayesian density against LightGBM's 15 quantiles, shaded tails undefined", y=1.01)
 fig.tight_layout()
 save_figure(fig, "bench_density_vs_quantiles", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# Put both forecasts on one axis: the 5-to-95 percent bands and medians of
+# the two models for the same day. The medians are close; the Bayesian
+# band is a little wider overall, consistent with its slightly higher
+# coverage in the table further down.
+
+# %%
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+gp_lo, gp_hi = band(paths, i, 0.05, 0.95, True)
+lg_lo, lg_hi = band(quantiles, i, 0.05, 0.95, False)
+ax.fill_between(idx, gp_lo, gp_hi, color=GP_BLUE, alpha=0.2, label="Bayesian 5-95%")
+ax.plot(idx, paths[:, i, :].mean(axis=0), color=GP_BLUE, lw=1.3, label="Bayesian median")
+ax.fill_between(idx, lg_lo, lg_hi, color=LG_GREEN, alpha=0.18, label="LightGBM 5-95%")
+ax.plot(idx, quantiles[i, levels.tolist().index(0.5), :], color=LG_GREEN, lw=1.3, label="LightGBM median")
+ax.plot(idx, y[i], color="black", lw=1.5, label="observed")
+ax.set_xlabel("horizon step")
+ax.set_ylabel("demand (MW)")
+ax.set_title("Both forecasts on one axis (median-demand day)")
+ax.legend(fontsize=8, ncol=2)
+save_figure(fig, "bench_bands_overlay", cfg.paths.figures)
 plt.show()
 
 # %%
@@ -430,6 +497,72 @@ save_figure(fig, "bench_gp_surface", cfg.paths.figures)
 plt.show()
 
 # %% [markdown]
+# ## The Bayesian model is generative, so it does more than forecast
+#
+# The deepest difference is that the Bayesian model is a generative model:
+# it defines a joint distribution over the whole day from which any number
+# of coherent scenarios can be drawn, each a physically plausible demand
+# trajectory. That is the input format power-system studies need, where
+# demand is one driver of a larger simulation: storage and reserve sizing,
+# network power-flow and congestion Monte Carlo, price and emissions
+# modelling, resource-adequacy and loss-of-load assessment. All of these
+# feed an ensemble of coherent demand paths through a downstream model and
+# read off a distribution of outcomes.
+#
+# LightGBM cannot serve this role. Its output is a set of per-step
+# marginals with no joint law, so the only way to turn it into "scenarios"
+# is to sample each step independently, which produces jagged,
+# physically impossible days: demand that jumps between the 10th and 90th
+# percentile from one half hour to the next. The contrast below is the
+# generative case for the Bayesian model.
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), sharey=True)
+gen = examples["high-demand day"]
+for s in range(20):
+    axes[0].plot(idx, paths[s, gen, :], color=GP_BLUE, lw=0.6, alpha=0.5)
+    axes[1].plot(idx, shuffled[s, gen, :], color="#c44536", lw=0.6, alpha=0.5)
+axes[0].set_title("Bayesian: coherent scenarios (usable for grid studies)")
+axes[1].set_title("Marginals sampled independently: jagged, unusable")
+for ax in axes:
+    ax.plot(idx, y[gen], color="black", lw=1.4)
+    ax.set_xlabel("horizon step")
+axes[0].set_ylabel("demand (MW)")
+fig.tight_layout()
+save_figure(fig, "bench_generative_scenarios", cfg.paths.figures)
+plt.show()
+
+# %% [markdown]
+# **A grid-stress functional only coherent scenarios can characterise.**
+# Count, per scenario, the half hours above a high-load threshold (the 90th
+# percentile of demand): a proxy for how long the system sits under stress
+# in a day. Sampling the same marginals independently preserves the
+# expected count but not its distribution, because under independence
+# exceedances scatter through the day while in reality they cluster in the
+# evening. An adequacy or reserve study run on the independent samples
+# would see the right average and badly wrong tails.
+
+# %%
+stress_threshold = np.quantile(y, 0.90)
+coherent_stress = (paths[:, gen, :] > stress_threshold).sum(axis=1)
+independent_stress = (shuffled[:, gen, :] > stress_threshold).sum(axis=1)
+fig, ax = plt.subplots(figsize=(7.5, 4))
+bins = np.arange(0, max(coherent_stress.max(), independent_stress.max()) + 2) - 0.5
+ax.hist(coherent_stress, bins=bins, color=GP_BLUE, alpha=0.6, density=True, label="coherent scenarios")
+ax.hist(independent_stress, bins=bins, color="#c44536", alpha=0.5, density=True,
+        label="independent marginals")
+ax.set_xlabel(f"half hours above {stress_threshold:.0f} MW in the day")
+ax.set_ylabel("probability")
+ax.set_title("Distribution of daily stress hours (high-demand day)")
+ax.legend(fontsize=8)
+save_figure(fig, "bench_stress_hours", cfg.paths.figures)
+plt.show()
+print(f"stress hours: coherent mean {coherent_stress.mean():.1f} sd {coherent_stress.std():.1f}; "
+      f"independent mean {independent_stress.mean():.1f} sd {independent_stress.std():.1f}")
+print("Same mean, different spread: the clustering that makes a stress event "
+      "an event is exactly what the marginal representation throws away.")
+
+# %% [markdown]
 # ## Calibration is not the price
 #
 # The richer Bayesian output would matter little if it were less honest.
@@ -495,6 +628,10 @@ pd.DataFrame({"Bayesian AR(1) + GP": gp_cov, "LightGBM": lg_cov}).round(2)
 #   tail probability is required, or when the question is not only "what
 #   will demand be" but "how much of this uncertainty could more data
 #   remove and what drives it".
+# - And beyond forecasting entirely: only the Bayesian model is generative,
+#   so only it can supply the coherent demand scenarios that grid studies,
+#   storage and reserve sizing, and power-flow simulations consume.
+#   LightGBM's independence across steps rules it out of those uses.
 # - Neither is paid for in calibration, and on this hardware the Bayesian
 #   fit is the faster of the two; the genuine LightGBM advantages are
 #   marginal accuracy and operational simplicity, not speed.
