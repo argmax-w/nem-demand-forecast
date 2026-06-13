@@ -18,9 +18,10 @@
 #
 # **Goal.** Fit the structural time-series model by mean-field and
 # full-rank ADVI, use the exact variance decomposition to diagnose why it
-# loses to the seasonal naive at the 48-step horizon, and fit the repaired
-# model the diagnosis points to: the same regression with a stationary
-# AR(1) error in innovations form. Notebook 04 adjudicates the surrogates
+# trails the classical baseline at the 48-step horizon despite filtering
+# better than anything in the field, and fit the repaired model the
+# diagnosis points to: the same regression with a stationary AR(1) error
+# in innovations form. Notebook 04 adjudicates the surrogates
 # against NUTS; notebook 05 compares all models.
 #
 # ## The trend formulation, states marginalised
@@ -133,13 +134,16 @@ def per_horizon_crps(paths: np.ndarray) -> np.ndarray:
 #
 # Mean-field, full-rank and NUTS agree on this model's forecasts to within
 # half a percent, so the failure is the model, not the inference. The
-# posterior shrinks the level innovation to nothing and inflates the slope
-# innovation to roughly five percent of a standard deviation per half
-# hour, damped at $\phi \approx 0.76$. A heavily damped, heavily driven
-# slope is a wiggle-tracker: excellent filtering (its one-step CRPS beats
-# every model in the project) but slope noise integrates into the level,
-# so by 48 steps the spread passes 2,000 MW where ARIMA sits near 700 and
-# the CRPS crosses ARIMA's at the third half hour.
+# posterior shrinks the level innovation to a couple of megawatts per step
+# and inflates the slope innovation to roughly five percent of a standard
+# deviation per half hour, damped at $\phi \approx 0.67$. A heavily damped,
+# heavily driven slope is a wiggle-tracker: excellent filtering (its
+# one-step CRPS of about 60 MW is the best in the field) but slope noise
+# integrates into the level, so the predictive spread fans from 110 MW at
+# the first step to roughly 1,600 MW at 48 where ARIMA sits near 600, and
+# the CRPS crosses ARIMA's within the first two hours. The model still
+# clears the weekly-naive floor; it simply cannot turn good filtering into
+# a good day-ahead forecast.
 
 # %%
 sigma_slope = trend_nuts["post_sigma_slope"].ravel()
@@ -516,7 +520,8 @@ pd.DataFrame(rows).T.round(3)
 #
 # - All three inference routes agree on the trend model's forecasts, so
 #   its failure is structural: process noise dominates the decomposition
-#   and the 48-step CRPS lands behind the seasonal naive.
+#   and the 48-step CRPS lands far behind the classical baseline even
+#   though the one-step forecast is the sharpest in the field.
 # - The innovations-form AR(1) keeps the regression and the
 #   heteroskedastic scale, replaces the trend with the stationary error
 #   the ARIMA order pointed to, fits in seconds rather than most of an

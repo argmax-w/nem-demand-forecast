@@ -515,26 +515,33 @@ pd.DataFrame(warm_rows).T.round(2)
 # %% [markdown]
 # ## Conclusions
 #
-# - Every model clears the naive floor. The Bayesian AR(1) beats the
-#   classical baseline by 41 MW CRPS (bootstrap CI roughly -57 to -27,
-#   p < 0.001) and the ablation attributes the gain to the
-#   heteroskedastic head: the same model with a constant scale gives 53
-#   of those megawatts back. BART and the Bayesian AR(1) are
-#   statistically tied (3.5 MW, p = 0.63).
-# - LightGBM wins marginal CRPS, and the gap is real (47 MW, p < 0.001).
-#   It is a point-accuracy gap, not an uncertainty gap: median MAE 240
-#   against 311, concentrated beyond five hours of lead time and in the
-#   evening ramp, where boosted trees flex the peak shape in ways a
-#   linear-in-features regression cannot. Within the first two hours the
-#   Bayesian AR(1) is the most accurate model in the field (first
-#   half-hour CRPS near 60 MW against LightGBM's 220), because the AR
-#   carry conditions on the latest observation and decays from there.
-# - What the quantile heads do not provide: a density (no log score),
-#   coherent 48-step paths (no energy score; the Bayesian AR(1) posts
-#   the best in the field) and any decomposition of predictive
-#   uncertainty. For decisions that span the horizon jointly, per-step
-#   quantiles are not a substitute for paths.
+# - The all-season test is harder than any single season, so every
+#   absolute score is larger than a one-season evaluation would report;
+#   the ranking is what matters. The Bayesian AR(1) beats the classical
+#   baseline by about 20 MW CRPS (p < 0.001), and the ablation attributes
+#   that to the heteroskedastic head: a constant scale gives roughly 13 of
+#   those megawatts back (p = 0.009).
+# - The learned GP interaction surface improves on the hand-made columns
+#   by a further few megawatts (p around 0.06). The improvement points the
+#   right way because validation now spans every season the test set does,
+#   so a surface tuned on validation generalises rather than overfitting
+#   one season; that transfer is the whole point of the season-blocked
+#   split.
+# - LightGBM wins marginal CRPS by a clear margin (about 65 MW,
+#   p < 0.001). It is a point-accuracy gap concentrated at longer lead
+#   times and in the evening ramp, where boosted trees flex the peak shape
+#   in ways a linear-in-features regression cannot; within the first hours
+#   the Bayesian model is the sharpest in the field, because the AR carry
+#   conditions on the latest observation. What the quantile heads do not
+#   provide is a density (no log score), coherent 48-step paths (no energy
+#   score, which the Bayesian AR(1) leads) or any decomposition of
+#   predictive uncertainty.
+# - BART does not transfer to the harder all-season target: it is
+#   statistically level with ARIMA (p around 0.18) and well behind the
+#   Bayesian AR(1). The Bayesian gain here is structural, from the AR
+#   error and the heteroskedastic scale, not from the model class being
+#   Bayesian.
 # - Inference choice does not move prediction: mean-field, full-rank and
-#   NUTS forecast within a third of a megawatt of each other. The
-#   differences live in the posterior itself and in what it costs, which
-#   is notebook 04's accounting.
+#   NUTS forecast within a megawatt of each other. The differences live in
+#   the posterior itself and in what it costs, which is notebook 04's
+#   accounting.

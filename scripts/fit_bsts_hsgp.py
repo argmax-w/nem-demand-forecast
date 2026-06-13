@@ -3,11 +3,11 @@
 The hand-made interaction columns carry the non-linearities the EDA could
 see; this variant adds a truncated spectral Gaussian process over time of
 day and temperature so the data choose the rest of the surface, with
-kernel-structured shrinkage in the weight priors. Everything else matches
-the innovations suite: mean-field and full-rank ADVI, then warm-started
-NUTS from the full-rank guide as the reference posterior (cold chains
-inherit the AR model's degenerate basins), with predictions and all
-weather variants from the reference.
+kernel-structured shrinkage in the weight priors. It is fitted by mean-field
+and full-rank ADVI, and the full-rank fit carries the predictions. Unlike
+the plain AR(1) model, its NUTS posterior is multimodal (the kernel
+amplitude and the basis weights form a funnel that traps chains in distinct
+modes), so a NUTS run is kept only to document that, not for prediction.
 """
 
 from __future__ import annotations
