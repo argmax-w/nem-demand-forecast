@@ -401,20 +401,22 @@ plt.show()
 
 # %% [markdown]
 # For completeness, the trend model told the opposite story: its collapsed
-# likelihood mixed cleanly from cold (max R-hat 1.004, no divergences) and
-# the warm start was an economy rather than a necessity, cutting
-# wall-clock to the ESS target roughly in half.
+# likelihood mixed cleanly from cold (max R-hat about 1.01, no divergences)
+# and the warm start was an economy rather than a necessity, cutting
+# wall-clock to the ESS target by several-fold.
 
 # %% [markdown]
-# ## GPU against CPU, both formulations
+# ## GPU against CPU
 #
-# Every fit was rerun on the CPU (chains in parallel across cores) with
-# identical code, settings and timing barriers. The collapsed likelihood
-# is a 15,000-step sequential scan inside every gradient: the GPU cannot
-# parallelise it, so the CPU wins the long fits outright. The innovations
-# likelihood is pure matrix arithmetic: the GPU wins everywhere, and both
-# devices finish in seconds. Likelihood design, not hardware, was the
-# binding constraint all along.
+# The innovations likelihood is pure matrix arithmetic, so it was fitted on
+# the GPU and rerun on the CPU with identical code and timing barriers; the
+# GPU wins throughout and both devices finish in seconds. The collapsed
+# likelihood is the opposite case: a sequential scan inside every gradient.
+# It is fitted on the CPU (chains in parallel across cores), and the GPU is
+# tried only as a benchmark, capped at 2,000 ADVI steps so the per-step
+# rate is comparable. The scan is so hostile to the GPU that the sampler's
+# kernel does not even compile there; only the variational fits run, and
+# slowly. Likelihood design, not hardware, is the binding constraint.
 
 
 # %%
@@ -425,38 +427,59 @@ def wall_seconds(meta: dict) -> float:
     return t["warmup_seconds"] + t["sample_seconds"]
 
 
-def bench_table(prefix: str) -> pd.DataFrame:
-    stems = {
-        "ADVI mean-field": f"{prefix}_vi_meanfield",
-        "ADVI full-rank": f"{prefix}_vi_fullrank",
-        "NUTS cold": f"{prefix}_nuts_cold",
-    }
-    for kind in ("meanfield", "fullrank"):
-        for reduced in cfg.warm_start.reduced_warmup:
-            stems[f"NUTS warm {kind} w={reduced}"] = f"{prefix}_nuts_warm_{kind}_w{reduced}"
-    rows = {}
-    for label, stem in stems.items():
-        gpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
-        cpu_meta = json.loads((cfg.paths.artifacts / f"{stem}.cpu.json").read_text())
-        gpu_s, cpu_s = wall_seconds(gpu_meta), wall_seconds(cpu_meta)
-        rows[label] = {"GPU (s)": gpu_s, "CPU (s)": cpu_s, "GPU speed-up": cpu_s / gpu_s}
-    return pd.DataFrame(rows).T
+def steps_per_second(meta: dict) -> float:
+    return meta["timings_seconds"].get("steps_per_second", float("nan"))
 
 
-bench = pd.concat(
-    {
-        "collapsed (Kalman scan)": bench_table("bsts_collapsed"),
-        "innovations (no scan)": bench_table("bsts_innovations"),
-    }
-)
-bench.round(2)
+# Innovations: GPU is the primary fit, CPU the sidecar.
+innov_stems = {
+    "ADVI mean-field": "bsts_innovations_vi_meanfield",
+    "ADVI full-rank": "bsts_innovations_vi_fullrank",
+}
+for kind in ("meanfield", "fullrank"):
+    for reduced in cfg.warm_start.reduced_warmup:
+        innov_stems[f"NUTS warm {kind} w={reduced}"] = (
+            f"bsts_innovations_nuts_warm_{kind}_w{reduced}"
+        )
+innov_rows = {}
+for label, stem in innov_stems.items():
+    gpu = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
+    cpu = json.loads((cfg.paths.artifacts / f"{stem}.cpu.json").read_text())
+    gpu_s, cpu_s = wall_seconds(gpu), wall_seconds(cpu)
+    innov_rows[label] = {"GPU (s)": gpu_s, "CPU (s)": cpu_s, "GPU speed-up": cpu_s / gpu_s}
+print("Innovations model: GPU against CPU (seconds)")
+print(pd.DataFrame(innov_rows).T.round(2).to_string())
 
 # %% [markdown]
-# One caveat on the collapsed GPU rows: the asynchronous dispatch barrier
-# sits between warmup and sampling, but on the GPU the vectorised cold
-# run's warmup compute leaks into its sampling figure, so only the totals
-# are comparable for that row. All conclusions above use totals.
-#
+# The collapsed model is fitted on the CPU. The table below compares the
+# variational per-step rate on CPU against the capped GPU benchmark, and
+# records which collapsed fits the GPU backend refused to compile.
+
+# %%
+collapsed_rows = {}
+for label, stem in (
+    ("ADVI mean-field", "bsts_collapsed_vi_meanfield"),
+    ("ADVI full-rank", "bsts_collapsed_vi_fullrank"),
+):
+    cpu = json.loads((cfg.paths.artifacts / f"{stem}.json").read_text())
+    gpu_path = cfg.paths.artifacts / f"{stem}.gpu.json"
+    row = {"CPU steps/s": steps_per_second(cpu), "CPU fit (s)": wall_seconds(cpu)}
+    if gpu_path.exists():
+        gpu = json.loads(gpu_path.read_text())
+        row["GPU steps/s"] = steps_per_second(gpu) if "timings_seconds" in gpu else float("nan")
+        row["GPU compiled"] = "timings_seconds" in gpu
+    collapsed_rows[label] = row
+nuts_compiled = {}
+for stem in ("bsts_collapsed_nuts_cold", "bsts_collapsed_nuts_warm_fullrank_w300"):
+    gpu_path = cfg.paths.artifacts / f"{stem}.gpu.json"
+    if gpu_path.exists():
+        gpu = json.loads(gpu_path.read_text())
+        nuts_compiled[stem] = "compiled" if "timings_seconds" in gpu else "compile FAILED"
+print("Collapsed model: CPU fit against GPU benchmark")
+print(pd.DataFrame(collapsed_rows).T.round(3).to_string())
+print("\nCollapsed NUTS on GPU:", nuts_compiled or "benchmark not run")
+
+# %% [markdown]
 # ## Summary
 #
 # - Cold NUTS on the innovations model is defeated by degenerate basins

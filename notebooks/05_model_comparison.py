@@ -269,6 +269,7 @@ pairs = [
     ("Bayesian AR(1) homoskedastic", "ARIMA"),
     ("LightGBM", "ARIMA"),
     ("BART", "LightGBM"),
+    ("BART", "ARIMA"),
     ("Bayesian AR(1) MF-ADVI", "Bayesian AR(1) NUTS"),
     ("ARIMA", "seasonal naive"),
 ]
