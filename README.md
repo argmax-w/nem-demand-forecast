@@ -73,6 +73,12 @@ price its heteroskedastic variance head separately.
    probabilities, and a decomposition of predictive variance into
    reducible and irreducible parts. Each claim is demonstrated, with the
    compute and calibration cost of each measured both ways.
+6. **Operations** (notebook 07). The Bayesian model run as a control-room
+   forecaster on a real winter peak: the live forecast, how it sharpens
+   across intraday re-issues as the AR(1) error reads the day's emerging
+   level, the probability of a spike against the past maximum and how it
+   resolves in time to act, and the ramp, stress-duration and reserve
+   metrics an operator reads off, all from one coherent predictive.
 
 ## Results
 
@@ -110,7 +116,7 @@ origin the Bayesian model is the sharpest in the field.
   scores, calibration, sampler diagnostics), `splits.py`, `plotting.py`.
 - `scripts/`: download, build and fit entry points; every fit writes
   `artifacts/{name}.npz` plus `.json` metadata that the notebooks read.
-- `notebooks/`: the six-notebook narrative listed above.
+- `notebooks/`: the seven-notebook narrative listed above.
 - `tests/`: scoring rules (sample CRPS verified against the analytic
   Gaussian), features, splits, loaders, the innovations likelihood
   (verified against a hand computation) and a leakage audit: training
