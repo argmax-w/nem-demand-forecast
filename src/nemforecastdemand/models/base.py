@@ -46,7 +46,10 @@ class Forecast:
     predictive, the classical models), ``samples`` (posterior predictive
     draws, the Bayesian models) or ``quantile_values`` with their levels
     (the gradient-boosted quantile heads). ``mean`` is the point forecast,
-    the predictive median for quantile forecasters.
+    the predictive median for quantile forecasters. ``mean_estimate`` is an
+    explicit conditional mean, set only when a model trains one separately
+    from its point forecast (the LightGBM L2 head), for the mean-against-
+    median comparison.
     """
 
     origin: pd.Timestamp
@@ -56,6 +59,7 @@ class Forecast:
     samples: np.ndarray | None = None
     quantile_levels: np.ndarray | None = None
     quantile_values: np.ndarray | None = None
+    mean_estimate: np.ndarray | None = None
 
 
 def weather_columns(panel: pd.DataFrame, source: str) -> pd.DataFrame:

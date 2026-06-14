@@ -16,6 +16,11 @@ head serves as the point forecast. Heads are trained independently, so
 quantile crossing is possible and repaired by sorting. Trees cannot
 extrapolate beyond the training range of the target, a structural
 limitation for trending series.
+
+A separate L2 (squared-error) head is also trained so the model has a
+genuine conditional-mean predictor, not just the median quantile. It does
+not enter the quantile set or the scoring; it exists only for the
+mean-against-median point-forecast comparison.
 """
 
 from __future__ import annotations
@@ -77,7 +82,9 @@ class LightGbmQuantile(Forecaster):
         self.cfg = cfg
         self.quantiles = quantiles
         self._heads: dict[float, LGBMRegressor] = {}
+        self._mean_head: LGBMRegressor | None = None
         self.best_iterations: dict[float, int] = {}
+        self.mean_best_iteration: int | None = None
 
     def fit(
         self,
@@ -119,6 +126,14 @@ class LightGbmQuantile(Forecaster):
                 f"  quantile {level:.3f}: {self.best_iterations[level]} trees",
                 flush=True,
             )
+
+        # A genuine conditional-mean head, trained on squared error, so the
+        # benchmark has a mean point forecast to set beside its median.
+        mean_head = LGBMRegressor(objective="regression", **_LGBM_PARAMS)
+        mean_head.fit(train_design, train_y, **eval_kwargs)
+        self._mean_head = mean_head
+        self.mean_best_iteration = int(mean_head.best_iteration_ or _LGBM_PARAMS["n_estimators"])
+        print(f"  mean (L2): {self.mean_best_iteration} trees", flush=True)
         return self
 
     def forecast(
@@ -140,10 +155,12 @@ class LightGbmQuantile(Forecaster):
         # quantile function without changing any single head's calibration.
         quantile_values = np.sort(raw, axis=0)
         median = quantile_values[self.quantiles.index(0.5)]
+        mean_estimate = None if self._mean_head is None else self._mean_head.predict(block)
         return Forecast(
             origin=origin,
             index=index,
             mean=median,
             quantile_levels=np.asarray(self.quantiles),
             quantile_values=quantile_values,
+            mean_estimate=mean_estimate,
         )

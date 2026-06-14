@@ -255,6 +255,64 @@ master = pd.DataFrame(table).T
 master.round(2)
 
 # %% [markdown]
+# ## Mean or median as the point forecast?
+#
+# The master table scores each model on its natural point forecast: the
+# predictive mean for the Gaussian models, the median for the sample and
+# quantile models. The two differ only when the predictive is skewed, so the
+# table below sets MAE and RMSE from the mean against the median for every
+# model that has both, with the average gap between them. ARIMA is Gaussian
+# so they coincide exactly; LightGBM has no single predictive, its median is
+# the pinball-0.5 head and its mean a separately trained L2 head.
+
+# %%
+def _mae(point):
+    return float(np.abs(y_test - point).mean())
+
+
+def _rmse(point):
+    return float(np.sqrt(((y_test - point) ** 2).mean()))
+
+
+def _point_pair(mean_point, median_point):
+    return {
+        "MAE mean": _mae(mean_point),
+        "MAE median": _mae(median_point),
+        "RMSE mean": _rmse(mean_point),
+        "RMSE median": _rmse(median_point),
+        "mean-median gap (MW)": float(np.abs(mean_point - median_point).mean()),
+    }
+
+
+fr_paths = ar_vi["fullrank"][0]["forecast_paths"]
+point_summary = pd.DataFrame(
+    {
+        "Bayesian AR(1) FR-ADVI": _point_pair(fr_paths.mean(0), np.median(fr_paths, 0)),
+        "Bayesian AR(1) NUTS": _point_pair(
+            ar_nuts["forecast_paths"].mean(0), np.median(ar_nuts["forecast_paths"], 0)
+        ),
+        "ARIMA": _point_pair(arima["forecast_mean"], arima["forecast_mean"]),
+        "BART": _point_pair(bart["forecast_paths"].mean(0), np.median(bart["forecast_paths"], 0)),
+        "LightGBM": _point_pair(
+            gbdt["forecast_mean"], gbdt["forecast_quantiles"][:, gbdt_levels.tolist().index(0.5), :]
+        ),
+    }
+).T[["MAE mean", "MAE median", "RMSE mean", "RMSE median", "mean-median gap (MW)"]]
+point_summary.round(1)
+
+# %% [markdown]
+# The split is clean. The Gaussian and near-Gaussian models are indifferent
+# to the choice: ARIMA exactly, and the Bayesian AR(1) under both ADVI and
+# NUTS to a fraction of a megawatt, with ADVI matching NUTS because the
+# posterior is identified tightly enough to be effectively Gaussian. The
+# tree models are not. BART's median beats its mean, and LightGBM's median
+# beats its L2 mean on both MAE and RMSE by around 10 MW, with a mean-median
+# gap an order of magnitude larger than the Bayesian model's. The
+# conditional demand distribution is right-skewed at the peaks, so the mean
+# sits above the median and tracks typical days worse; for a skewed target
+# the median is the safer point forecast.
+
+# %% [markdown]
 # ## Are the differences real?
 #
 # Paired block bootstrap over origins on per-origin CRPS (10,000

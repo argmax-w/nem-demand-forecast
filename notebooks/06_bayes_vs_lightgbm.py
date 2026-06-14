@@ -50,11 +50,12 @@ from nemforecastdemand.evaluation.metrics import (
     energy_score,
     log_score_samples,
 )
-from nemforecastdemand.models import bsts
+from nemforecastdemand.models import bsts, innovations
+from nemforecastdemand.models.base import build_design, variance_design
 from nemforecastdemand.models.hsgp import gp_design
 from nemforecastdemand.models.predict import variance_decomposition_innovations
 from nemforecastdemand.plotting import palette, save_figure, setup_style
-from nemforecastdemand.splits import rolling_origins
+from nemforecastdemand.splits import horizon_index, rolling_origins
 from nemforecastdemand.utils import load_artifact
 
 setup_style()
@@ -69,11 +70,16 @@ cfg_gp = replace(
 
 gp, gp_meta = load_artifact(cfg.paths.artifacts / "bsts_hsgp_vi_fullrank")
 gbdt, gbdt_meta = load_artifact(cfg.paths.artifacts / "gbdt")
-ar_meta = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_warm_fullrank_w300")[1]
+# The plain AR(1) model is the one fitted both ways, so the ADVI-against-NUTS
+# point-summary question is asked on it; the GP variant is ADVI only.
+ar_advi = load_artifact(cfg.paths.artifacts / "bsts_innovations_vi_fullrank")[0]
+ar_nuts, ar_meta = load_artifact(cfg.paths.artifacts / "bsts_innovations_nuts_warm_fullrank_w300")
 levels = np.array(gbdt_meta["quantile_levels"])
 
 paths = gp["forecast_paths"]  # (S, O, H) coherent posterior predictive paths
 quantiles = gbdt["forecast_quantiles"]  # (O, Q, H) per-step marginal quantiles
+lg_median = quantiles[:, levels.tolist().index(0.5), :]  # the pinball-0.5 point forecast
+lg_mean = gbdt["forecast_mean"]  # the separately trained L2 mean head
 y = gp["y_test"]
 n_draws, n_origins, horizon = paths.shape
 hours = (np.arange(horizon) + 1) / 2
@@ -112,16 +118,6 @@ def band(model_paths_or_quantiles, i, lo, hi, is_paths):
 
 idx = np.arange(horizon)
 
-
-def lgbm_mean(qi):
-    """Estimate E[Y] from LightGBM's quantile heads by integrating the
-    quantile function, holding the outer quantiles flat across the unmodelled
-    tails. LightGBM has no native mean, only quantile heads, so this is a
-    derived estimate, not a model output. ``qi`` is one origin's ``(Q, H)``."""
-    p = np.concatenate([[0.0], levels, [1.0]])
-    qq = np.concatenate([qi[:1], qi, qi[-1:]], axis=0)
-    return np.sum(0.5 * (qq[1:] + qq[:-1]) * np.diff(p)[:, None], axis=0)
-
 # %% [markdown]
 # ## The headline trade
 #
@@ -151,10 +147,10 @@ plt.show()
 # The four days below are chosen by test-set CRPS to keep the comparison
 # fair: one both models forecast well, one both find hard, and the two days
 # where they most disagree. Each panel shows the 95, 80 and 50 percent
-# bands, the median (solid) and the mean (dashed), against the observed
-# (black). The Bayesian bands come from the sampled paths; LightGBM's come
-# from its quantile heads, and because it has no native mean its dashed line
-# is the mean implied by integrating those quantiles.
+# bands, the median (solid) and the mean (dashed) against the observed
+# (black): the posterior mean for the Bayesian model, the L2-head mean for
+# LightGBM. The Bayesian bands come from the sampled paths, LightGBM's from
+# its quantile heads.
 
 # %%
 gr = gp_origin_crps.argsort().argsort()  # 0 = best-scored test day
@@ -190,7 +186,7 @@ for row, (label, i) in enumerate(fan_days.items()):
     axes[row, 1].plot(
         idx, quantiles[i, levels.tolist().index(0.5), :], color=LG_GREEN, lw=1.3, label="median"
     )
-    axes[row, 1].plot(idx, lgbm_mean(quantiles[i]), color=LG_GREEN, lw=1.0, ls="--", label="mean (integrated)")
+    axes[row, 1].plot(idx, lg_mean[i], color=LG_GREEN, lw=1.0, ls="--", label="mean")
     axes[row, 1].plot(idx, y[i], color="black", lw=1.3, label="observed")
     axes[row, 1].annotate(
         f"CRPS {lg_origin_crps[i]:.0f}", (0.03, 0.88), xycoords="axes fraction", fontsize=8
@@ -198,6 +194,7 @@ for row, (label, i) in enumerate(fan_days.items()):
 axes[0, 0].set_title("Bayesian AR(1) + GP (95, 80, 50% bands)")
 axes[0, 1].set_title("LightGBM (95, 80, 50% bands)")
 axes[0, 0].legend(fontsize=7, ncol=3, loc="upper right")
+axes[0, 1].legend(fontsize=7, ncol=3, loc="upper right")
 axes[-1, 0].set_xlabel("horizon step")
 axes[-1, 1].set_xlabel("horizon step")
 fig.tight_layout()
@@ -209,18 +206,18 @@ plt.show()
 # the GP surface fit the day cleanly while LightGBM runs wide; on 19 Jul it
 # is the reverse, LightGBM nailing a day the Bayesian model misjudges. The
 # shared-hard day is the 11 Feb heat afternoon both under-forecast. Across
-# all four the mean and median traces sit almost on top of each other, which
-# answers a natural question: does it matter whether the Bayesian point
-# forecast is read off as the posterior mean or the median? Both are defined
-# for it (the median minimises expected absolute error, the mean expected
-# squared error); LightGBM gives neither directly, only its 0.5 quantile
-# head. The table prices the choice on the test set.
+# all four the Bayesian mean and median sit almost on top of each other
+# while LightGBM's two heads separate on the peaks, which already hints at
+# what follows. It raises a natural question: does it matter whether the
+# point forecast
+# is the mean or the median, and does the answer depend on the model or on
+# how it was fitted? The median minimises expected absolute error and the
+# mean expected squared error, so the two part company only when the
+# predictive is skewed. The table sets MAE and RMSE from each summary, for
+# the Bayesian model fitted by ADVI and by NUTS and for LightGBM with its
+# median head beside the separately trained mean head.
 
 # %%
-gp_mean_path = paths.mean(axis=0)
-gp_median_path = np.median(paths, axis=0)
-
-
 def _mae(a):
     return float(np.abs(a - y).mean())
 
@@ -229,24 +226,52 @@ def _rmse(a):
     return float(np.sqrt(((a - y) ** 2).mean()))
 
 
-pd.DataFrame(
-    {
-        "from posterior mean": {"MAE (MW)": _mae(gp_mean_path), "RMSE (MW)": _rmse(gp_mean_path)},
-        "from posterior median": {"MAE (MW)": _mae(gp_median_path), "RMSE (MW)": _rmse(gp_median_path)},
+def _summary(point_mean, point_median):
+    return {
+        "MAE mean": _mae(point_mean),
+        "MAE median": _mae(point_median),
+        "RMSE mean": _rmse(point_mean),
+        "RMSE median": _rmse(point_median),
     }
-).round(1)
+
+
+point_summary = pd.DataFrame(
+    {
+        "Bayesian AR(1)+GP (ADVI)": _summary(paths.mean(0), np.median(paths, 0)),
+        "Bayesian AR(1) (ADVI)": _summary(
+            ar_advi["forecast_paths"].mean(0), np.median(ar_advi["forecast_paths"], 0)
+        ),
+        "Bayesian AR(1) (NUTS)": _summary(
+            ar_nuts["forecast_paths"].mean(0), np.median(ar_nuts["forecast_paths"], 0)
+        ),
+        "LightGBM": _summary(lg_mean, lg_median),
+    }
+).T[["MAE mean", "MAE median", "RMSE mean", "RMSE median"]]
+point_summary.round(1)
 
 # %% [markdown]
-# It barely matters here. MAE and RMSE agree to within about 0.1 MW between
-# the two summaries, a difference at the level of rounding, because the
-# predictive is almost symmetric: the mean and median differ by 7 MW on
-# average against demand near 8 GW, and the per-cell skew is essentially
-# zero. The theory still holds underneath (the median is the L1-optimal
-# summary, the mean the L2-optimal), but with a near-Gaussian predictive the
-# two coincide and the distinction is moot. It would matter for a skewed
-# predictive, a heavy-tailed peak say, and the value of the Bayesian model
-# is that you can make the choice deliberately, where a quantile model only
-# ever hands you the median.
+# Two findings. For the Bayesian model the choice is immaterial and the
+# inference method does not change that: ADVI and NUTS give the same MAE and
+# RMSE to a fraction of a megawatt, and mean and median agree to about 7 MW
+# on demand near 8 GW. The worry that a non-Gaussian NUTS posterior might
+# pull the mean off the median does not bite here, because with two years of
+# half-hourly data and a handful of parameters the posterior is pinned down
+# so tightly that it is effectively Gaussian (rho has a posterior standard
+# deviation of 0.001 and near-zero skew under both ADVI and NUTS); the small
+# gap that remains comes from the heteroskedastic likelihood, not posterior
+# shape. ADVI is a faithful surrogate for this model.
+#
+# LightGBM is the opposite case. Its median, the pinball-0.5 head and so
+# exactly the MAE-optimal predictor, beats the separately trained mean head
+# on MAE and, unusually, on RMSE too, with the two diverging by about 90 MW
+# on average against 7 MW for the Bayesian model. The mean and median here
+# are two different fitted models rather than two summaries of one
+# predictive, and the squared-error head is dragged upward by the heavy
+# right tail of demand (the peaks), so it tracks typical days worse and
+# generalises less well across the season-blocked split. For a skewed
+# target the median is the safer point forecast, and a single coherent
+# predictive lets you read both summaries off the same object instead of
+# training a second model for the other one.
 
 # %% [markdown]
 # ## Where LightGBM wins
@@ -613,6 +638,103 @@ ax.set_ylabel("temperature (C)")
 ax.set_title("The learned temperature-by-time-of-day surface")
 save_figure(fig, "bench_gp_surface", cfg.paths.figures)
 plt.show()
+
+# %% [markdown]
+# ### 5. Forecast from any origin, out to any horizon
+#
+# The Bayesian model is fitted on the contiguous demand series, not on
+# stacked forecast blocks, so it defines a forecast from any half-hourly
+# origin and for any horizon. The two daily origins and the 48-step window
+# are the evaluation protocol, not a limit of the model, and LightGBM shares
+# neither freedom.
+#
+# Any start time. LightGBM is trained on origin blocks issued at 00:00 and
+# 12:00, which ties lead time to time of day in its rows; a forecast issued
+# at, say, 07:00 asks for lead-and-time-of-day pairs it never saw and it
+# extrapolates. Covering all 48 half-hourly origins would mean roughly 24
+# times the training blocks and a diluted recency signal. The Bayesian model
+# just conditions on the residual at whatever origin it is handed. Below it
+# forecasts the same day from four start times, each clean.
+#
+# Any horizon. Past 24 hours the one-day demand lag points inside the
+# forecast window, so the model is rolled forward: each day's central
+# forecast fills the lag for the next. The three-day forecast below does
+# that. LightGBM cannot be rolled this way, its heads are fixed to the 48
+# steps they were trained for, marked by the line at step 48.
+
+# %%
+rec_draws = {name: gp[f"draw_{name}"] for name in ("rho", "beta", "gamma0", "gamma")}
+
+
+def bayes_forecast(frame, origin, steps, seed):
+    """Predictive paths (S, steps) in MW from any origin, using ``frame``'s
+    demand for the lags, so a rolled-forward frame gives a recursive forecast."""
+    hist = frame.index[
+        (frame.index >= inputs.index[0]) & (frame.index <= origin + pd.Timedelta(minutes=30 * steps))
+    ]
+    design = build_design(frame, cfg_gp, "actual").loc[hist]
+    vdesign = variance_design(frame, cfg_gp, "actual").loc[hist]
+    x_hist, _ = bsts.transform_design(inputs, design, vdesign)
+    y_hist = ((frame["demand_mw"].loc[hist].to_numpy() - inputs.y_loc) / inputs.y_scale).astype(
+        np.float32
+    )
+    e0 = innovations.origin_residuals(rec_draws, y_hist, x_hist, hist.get_indexer([origin]))
+    target = horizon_index(origin, steps)
+    xf, zf = bsts.transform_design(inputs, design.loc[target], vdesign.loc[target])
+    sim = innovations.simulate_horizon_paths(rec_draws, e0, xf[None], zf[None], cfg_gp.bsts, seed=seed)
+    return np.asarray(sim[:, 0, :]) * inputs.y_scale + inputs.y_loc
+
+
+base = pd.Timestamp("2026-05-20 14:00", tz="UTC")  # 21 May 2026, 00:00 AEST
+window = panel.loc[base - pd.Timedelta(days=12) : base + pd.Timedelta(days=4)].copy()
+n_days = 3
+
+# Recursive multi-day: roll each day's central forecast into the one-day lag.
+roll, segments, cur = window.copy(), [], base
+for d in range(n_days):
+    seg = bayes_forecast(roll, cur, horizon, seed=cfg.seed + d)
+    segments.append(seg)
+    roll.loc[horizon_index(cur, horizon), "demand_mw"] = seg.mean(axis=0)
+    cur = cur + pd.Timedelta(hours=24)
+multi = np.concatenate(segments, axis=1)  # (S, 48 * n_days)
+multi_obs = panel["demand_mw"].loc[horizon_index(base, n_days * horizon)].to_numpy()
+multi_steps = np.arange(n_days * horizon)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.3))
+for lo, hi, a in fan_levels:
+    axes[0].fill_between(
+        multi_steps, np.quantile(multi, lo, 0), np.quantile(multi, hi, 0), color=GP_BLUE, alpha=a, lw=0
+    )
+axes[0].plot(multi_steps, np.median(multi, 0), color=GP_BLUE, lw=1.2, label="forecast median")
+axes[0].plot(multi_steps, multi_obs, color="black", lw=1.2, label="observed")
+axes[0].axvline(horizon, color="#c44536", ls="--", lw=1.0)
+axes[0].axvline(2 * horizon, color="grey", ls=":", lw=0.6)
+axes[0].text(horizon + 2, np.quantile(multi, 0.05, 0).min(), "LightGBM stops here",
+             fontsize=7, color="#c44536", va="bottom")
+axes[0].set_title(f"Recursive {n_days}-day forecast, one origin, rolled lag")
+axes[0].set_xlabel("horizon step (half hours)")
+axes[0].set_ylabel("demand (MW)")
+axes[0].legend(fontsize=8)
+
+span = horizon_index(base, 18 * 2 + horizon)
+span_hours = (span - base).total_seconds() / 3600
+axes[1].plot(span_hours, panel["demand_mw"].loc[span].to_numpy(), color="black", lw=1.0, label="observed")
+for colour, h in zip(("#1b6ca8", "#2e7d32", "#c44536", "#8d6e63"), (0, 6, 12, 18), strict=True):
+    issue = base + pd.Timedelta(hours=h)
+    fc = bayes_forecast(window, issue, horizon, seed=cfg.seed + 100 + h)
+    axes[1].plot(h + idx * 0.5, np.median(fc, 0), color=colour, lw=1.3,
+                 label=f"from {issue.tz_convert('Australia/Brisbane').strftime('%H:%M')}")
+axes[1].set_title("Same day, forecast issued from four origins")
+axes[1].set_xlabel("hours from start of day")
+axes[1].set_ylabel("demand (MW)")
+axes[1].legend(fontsize=7)
+fig.tight_layout()
+save_figure(fig, "bench_any_origin_horizon", cfg.paths.figures)
+plt.show()
+print(f"recursive {n_days}-day forecast MAE vs observed: "
+      f"{np.abs(np.median(multi, 0) - multi_obs).mean():.0f} MW")
+print("plug-in roll: each day's lag uses the previous day's central forecast, so the bands reflect "
+      "within-horizon noise given that path and understate compounding across days")
 
 # %% [markdown]
 # ## The Bayesian model is generative, so it does more than forecast

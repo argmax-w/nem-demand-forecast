@@ -28,6 +28,10 @@ def stack_quantiles(forecasts: list[Forecast]) -> np.ndarray:
     return np.stack([fc.quantile_values for fc in forecasts]).astype(np.float32)
 
 
+def stack_mean(forecasts: list[Forecast]) -> np.ndarray:
+    return np.stack([fc.mean_estimate for fc in forecasts]).astype(np.float32)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None, help="path to a configuration YAML")
@@ -66,6 +70,7 @@ def main() -> None:
     arrays = {"origins_test": test_origins.asi8, "y_test": y_test}
     for name, forecasts in variants.items():
         arrays[f"{name}_quantiles"] = stack_quantiles(forecasts)
+        arrays[f"{name}_mean"] = stack_mean(forecasts)
 
     levels = np.asarray(model.quantiles)
     headline = np.mean(
@@ -77,6 +82,7 @@ def main() -> None:
     meta = {
         "quantile_levels": list(model.quantiles),
         "best_iterations": {f"{k:g}": v for k, v in model.best_iterations.items()},
+        "mean_best_iteration": model.mean_best_iteration,
         "timings_seconds": timings,
         "headline_test_crps_mw": float(headline),
         "train_origins": len(train_origins),
