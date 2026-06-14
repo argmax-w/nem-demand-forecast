@@ -22,3 +22,6 @@ data/interim/
 
 # Heavy fit outputs
 artifacts/
+
+# Notebook sources: edited locally via jupytext, only the .ipynb are committed
+notebooks/*.py
