@@ -27,6 +27,8 @@ run_notebooks() {
     echo "=== executing ${nb} ==="
     $JT --to notebook --execute "${nb}"
   done
+  echo "=== rendering README figures ==="
+  $PY scripts/make_readme_figures.py
 }
 
 case "$STAGE" in
