@@ -49,6 +49,44 @@ def palette(name: str) -> str:
     return _PALETTE[name]
 
 
+# One canonical colour per model and fitting method, used consistently across
+# every notebook. The full-rank ADVI fit is the headline BSTS, so "BSTS" and
+# "BSTS-ADVI-FR" share a colour. "observed" is reserved (black) and is not a
+# model.
+MODEL_COLOURS = {
+    "observed": "#000000",
+    "seasonal naive": "#9a9a9a",
+    "ARIMA": "#c44536",
+    "LightGBM": "#2e7d32",
+    "BART": "#7a4988",
+    "BSTS": "#1f5673",
+    "BSTS-ADVI-FR": "#1f5673",
+    "BSTS-NUTS": "#e8a13a",
+}
+
+
+def model_colour(name: str) -> str:
+    """Canonical colour for a model-and-fitting-method label."""
+    return MODEL_COLOURS[name]
+
+
+def model_shades(name: str, n: int) -> list[str]:
+    """``n`` distinguishable shades of a model's colour, light to dark.
+
+    For showing one model at several lead or issue times without leaving its
+    colour family.
+    """
+    import matplotlib.colors as mcolors
+
+    base = np.array(mcolors.to_rgb(MODEL_COLOURS[name]))
+    factors = np.linspace(0.55, -0.4, n)  # > 0 lightens toward white, < 0 darkens
+    shades = []
+    for f in factors:
+        rgb = base + (1.0 - base) * f if f >= 0 else base * (1.0 + f)
+        shades.append(mcolors.to_hex(np.clip(rgb, 0.0, 1.0)))
+    return shades
+
+
 def display_index(index: pd.DatetimeIndex, tz: str = DISPLAY_TZ) -> pd.DatetimeIndex:
     """Convert a UTC index to the display timezone."""
     return index.tz_convert(tz)
@@ -154,6 +192,38 @@ def horizon_curve(
     steps = (np.arange(scores.shape[1]) + 1) / 2.0
     ax.plot(steps, scores.mean(axis=0), color=colour, label=label)
     ax.set_xlabel("lead time (hours)")
+
+
+def confidence_ellipse(
+    ax: plt.Axes,
+    mean: np.ndarray,
+    cov: np.ndarray,
+    n_std: float = 2.0,
+    **kwargs,
+) -> None:
+    """Draw an n-standard-deviation covariance ellipse for a 2D Gaussian.
+
+    Parameters
+    ----------
+    ax
+        Target axis.
+    mean
+        Centre, shape ``(2,)``.
+    cov
+        Covariance, shape ``(2, 2)``.
+    n_std
+        Radius in standard deviations; 2 covers about 86% of the mass.
+    """
+    from matplotlib.patches import Ellipse
+
+    values, vectors = np.linalg.eigh(cov)
+    order = values.argsort()[::-1]
+    values, vectors = values[order], vectors[:, order]
+    angle = np.degrees(np.arctan2(vectors[1, 0], vectors[0, 0]))
+    width, height = 2.0 * n_std * np.sqrt(values)
+    ax.add_patch(
+        Ellipse(xy=tuple(mean), width=width, height=height, angle=angle, fill=False, **kwargs)
+    )
 
 
 def save_figure(fig: plt.Figure, name: str, figures_dir: Path) -> Path:

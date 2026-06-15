@@ -1,26 +1,28 @@
-"""Innovations-form AR(1) regression: the BSTS revision without latent states.
+"""Innovations-form AR(2) regression: the project's BSTS model.
 
-The collapsed BSTS posterior shrank the level innovation to nothing and
-pushed every short-memory fluctuation through a heavily damped slope, which
-filtering loved and forecasting paid for: slope noise integrates into the
-level, so 48-step paths accumulated process variance until the model scored
-worse than the weekly naive. The ARIMA baseline points at the repair: its
-selected order (1, 0, 1) carries the same short-run autocorrelation in a
-stationary error instead of an integrated trend. This module is that
-structure on the Bayesian side: the same regression and heteroskedastic
-scale as the BSTS, with a stationary AR(1) error in place of the trend,
+A seasonal regression on the shared design with a stationary AR(2) error and
+a heteroskedastic observation scale, fitted by ADVI and NUTS,
 
     e_t = y_t - x_t' beta,
-    e_t - rho e_{t-1} ~ Normal(0, sigma_t),
+    e_t - rho1 e_{t-1} - rho2 e_{t-2} ~ Normal(0, sigma_t),
 
-and the first residual anchored at its stationary distribution. Writing the
-likelihood on the innovations rather than on latent error states removes
-the sequential dependence entirely: residuals come from one matrix product
-and the innovations from a shifted difference, so there is no scan, no
-Kalman pass and nothing the GPU dislikes. Because the error is first-order
-Markov, prediction conditions only on the residual at the forecast origin,
-which is observed exactly with no filtering uncertainty, and the h-step
-predictive moments are closed-form in powers of rho.
+and the first two residuals anchored at their stationary distribution. The
+second lag is what an AR(1) error cannot supply: AR(1) carries only the
+residual level forward and reverts toward the regression mean at a fixed
+rate, so its near-origin slope is fixed by that one number. AR(2) carries
+the last two residuals, so the forecast has a level and a slope at the
+origin, the curvature the residual diagnostics show (a large negative
+lag-2 partial autocorrelation). The coefficients are sampled through their
+partial autocorrelations (phi1, phi2 in (-1, 1)), which guarantees
+stationarity, with rho1 = phi1 (1 - phi2) and rho2 = phi2.
+
+Writing the likelihood on the innovations rather than on latent error states
+removes the sequential dependence entirely: residuals come from one matrix
+product and the innovations from shifted differences, so there is no scan,
+no Kalman pass and nothing the GPU dislikes. Because the error is second-
+order Markov, prediction conditions only on the two residuals at the
+forecast origin, both observed exactly, and the h-step predictive moments
+are closed form in the AR(2) impulse response.
 """
 
 from __future__ import annotations
@@ -33,7 +35,19 @@ import numpyro.distributions as dist
 
 from nemforecastdemand.config import BstsConfig
 
-HYPER_SITES = ("rho", "beta", "gamma0", "gamma")
+HYPER_SITES = ("phi1", "phi2", "beta", "gamma0", "gamma")
+
+# Support of each hyperparameter, for mapping draws to the unconstrained space
+# where the variational guide is Gaussian. The lag-1 partial autocorrelation
+# lives on the unit interval and the lag-2 on (-1, 1); the regression and the
+# heteroskedastic log-scale coefficients are unconstrained.
+HYPER_SUPPORTS = {
+    "phi1": "unit_interval",
+    "phi2": ("interval", -1.0, 1.0),
+    "beta": "real",
+    "gamma0": "real",
+    "gamma": "real",
+}
 
 
 def innovations_model(
@@ -42,7 +56,7 @@ def innovations_model(
     x_var: jnp.ndarray,
     bsts: BstsConfig,
 ) -> None:
-    """Regression with stationary AR(1) errors, fully vectorised.
+    """Regression with a stationary AR(2) error, fully vectorised.
 
     Parameters
     ----------
@@ -59,7 +73,13 @@ def innovations_model(
     priors = bsts.priors
     n_coefs = x_mean.shape[1]
 
-    rho = numpyro.sample("rho", dist.Beta(priors.ar_alpha, priors.ar_beta))
+    # Partial autocorrelations in (-1, 1) keep the AR(2) stationary for any
+    # draw; phi1 is the lag-1 PACF (strongly positive), phi2 the lag-2.
+    phi1 = numpyro.sample("phi1", dist.Beta(priors.ar_alpha, priors.ar_beta))
+    phi2 = numpyro.sample("phi2", dist.Uniform(-1.0, 1.0))
+    rho1 = numpyro.deterministic("rho1", phi1 * (1.0 - phi2))
+    rho2 = numpyro.deterministic("rho2", phi2)
+
     beta = numpyro.sample("beta", dist.Normal(0.0, priors.coef_scale).expand([n_coefs]).to_event(1))
     if bsts.heteroskedastic:
         gamma0 = numpyro.sample(
@@ -78,11 +98,19 @@ def innovations_model(
         )
 
     e = y - x_mean @ beta
-    # Stationary anchor for the first residual; with a time-varying scale
-    # this uses the scale at the first step, the exact form for the
-    # homoskedastic model and a one-observation approximation otherwise.
-    numpyro.sample("e_first", dist.Normal(0.0, sigma[0] / jnp.sqrt(1.0 - rho**2)), obs=e[0])
-    numpyro.sample("innovations", dist.Normal(rho * e[:-1], sigma[1:]), obs=e[1:])
+    # Stationary bivariate anchor for the first two residuals, using the
+    # scale at the first step (exact under homoskedasticity, a two-observation
+    # approximation otherwise).
+    var0 = sigma[0] ** 2 * (1.0 - rho2) / ((1.0 + rho2) * ((1.0 - rho2) ** 2 - rho1**2))
+    sd0 = jnp.sqrt(var0)
+    lag1_corr = rho1 / (1.0 - rho2)
+    numpyro.sample("e0", dist.Normal(0.0, sd0), obs=e[0])
+    numpyro.sample(
+        "e1", dist.Normal(lag1_corr * e[0], sd0 * jnp.sqrt(1.0 - lag1_corr**2)), obs=e[1]
+    )
+    numpyro.sample(
+        "innovations", dist.Normal(rho1 * e[1:-1] + rho2 * e[:-2], sigma[2:]), obs=e[2:]
+    )
 
 
 def _scales_and_regression(
@@ -103,11 +131,55 @@ def _scales_and_regression(
     return regression, sigma
 
 
-def _decay_weights(rho: jnp.ndarray, horizon: int) -> jnp.ndarray:
-    """Lower-triangular AR carry weights ``W[s, h, j] = rho_s^(h - j)``."""
+def _ar2_coeffs(draws: dict[str, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """AR(2) coefficients ``(rho1, rho2)`` from the sampled partial autocorrelations."""
+    phi1, phi2 = draws["phi1"], draws["phi2"]
+    return phi1 * (1.0 - phi2), phi2
+
+
+def _ar2_weights(
+    rho1: jnp.ndarray, rho2: jnp.ndarray, horizon: int
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """AR(2) forecast weights for every draw.
+
+    Returns
+    -------
+    tuple
+        ``A`` and ``B`` of shape ``(S, H)``: the carry coefficients so the
+        deterministic error at step ``h`` is ``A[h] e_last + B[h] e_prev``;
+        and ``W`` of shape ``(S, H, H)``, the lower-triangular MA weights
+        ``W[h, j] = psi_{h-j}`` with ``psi`` the AR(2) impulse response.
+    """
+    one, zero = jnp.ones_like(rho1), jnp.zeros_like(rho1)
+    # Carry coefficients: A_k (on e_last) and B_k (on e_prev), k = 1..H.
+    a_terms, b_terms = [rho1], [rho2]  # k = 1
+    a_pp, a_p = one, rho1  # A_0, A_1
+    b_pp, b_p = zero, rho2  # B_0, B_1
+    for _ in range(2, horizon + 1):
+        a_pp, a_p = a_p, rho1 * a_p + rho2 * a_pp
+        b_pp, b_p = b_p, rho1 * b_p + rho2 * b_pp
+        a_terms.append(a_p)
+        b_terms.append(b_p)
+    A = jnp.stack(a_terms, axis=1)
+    B = jnp.stack(b_terms, axis=1)
+    # Impulse response psi_0..H-1, psi_0 = 1, psi_1 = rho1.
+    psi_terms = [one]
+    if horizon > 1:
+        psi_terms.append(rho1)
+        p_pp, p_p = one, rho1
+        for _ in range(2, horizon):
+            p_pp, p_p = p_p, rho1 * p_p + rho2 * p_pp
+            psi_terms.append(p_p)
+    psi = jnp.stack(psi_terms, axis=1)  # (S, H)
     steps = jnp.arange(horizon)
     lag = steps[:, None] - steps[None, :]
-    return jnp.where(lag >= 0, rho[:, None, None] ** lag, 0.0)
+    W = jnp.where(lag >= 0, psi[:, jnp.clip(lag, 0, horizon - 1)], 0.0)
+    return A, B, W
+
+
+def _ar2_carry(A: jnp.ndarray, B: jnp.ndarray, e_block: jnp.ndarray) -> jnp.ndarray:
+    """Deterministic AR(2) error carried from the two origin residuals, ``(S, O, H)``."""
+    return A[:, None, :] * e_block[..., 0][:, :, None] + B[:, None, :] * e_block[..., 1][:, :, None]
 
 
 def origin_residuals(
@@ -116,16 +188,20 @@ def origin_residuals(
     x: np.ndarray,
     positions: np.ndarray,
 ) -> jnp.ndarray:
-    """Observed regression residual just before each origin, ``(S, O)``.
+    """The two observed residuals just before each origin, ``(S, O, 2)``.
 
-    ``positions`` indexes the origins in the history arrays; the residual
-    at ``position - 1`` is the last realised observation before forecast
-    issue, which is all a first-order error needs.
+    ``positions`` indexes the origins in the history arrays; ``[..., 0]`` is
+    the residual at ``position - 1`` (the last realised observation) and
+    ``[..., 1]`` the one at ``position - 2``, which is all a second-order
+    error needs.
     """
-    before = positions - 1
-    return jnp.asarray(y)[before][None, :] - jnp.einsum(
-        "ok,sk->so", jnp.asarray(x)[before], draws["beta"]
-    )
+    y = jnp.asarray(y)
+    x = jnp.asarray(x)
+
+    def resid_at(idx: np.ndarray) -> jnp.ndarray:
+        return y[idx][None, :] - jnp.einsum("ok,sk->so", x[idx], draws["beta"])
+
+    return jnp.stack([resid_at(positions - 1), resid_at(positions - 2)], axis=-1)
 
 
 def simulate_horizon_paths(
@@ -139,9 +215,10 @@ def simulate_horizon_paths(
 ) -> np.ndarray:
     """Simulate coherent predictive paths for every origin and draw.
 
-    The AR error at step h decomposes exactly into the carried origin
-    residual ``rho^(h+1) e_origin`` plus a weighted sum of future
-    innovations, so paths are one einsum per chunk rather than a scan.
+    The AR(2) error at step h decomposes exactly into the carried origin
+    residuals (``A_h e_last + B_h e_prev``) plus a weighted sum of future
+    innovations through the impulse response, so paths are a couple of
+    einsums per chunk rather than a scan.
 
     Returns
     -------
@@ -153,11 +230,12 @@ def simulate_horizon_paths(
     xv_future = jnp.asarray(xv_future)
 
     def one_chunk(block: dict[str, jnp.ndarray], e_block: jnp.ndarray, key) -> jnp.ndarray:
+        rho1, rho2 = _ar2_coeffs(block)
         regression, sigma = _scales_and_regression(block, x_future, xv_future, bsts.heteroskedastic)
-        weights = _decay_weights(block["rho"], horizon)
-        carry = block["rho"][:, None, None] ** jnp.arange(1, horizon + 1) * e_block[:, :, None]
+        A, B, W = _ar2_weights(rho1, rho2, horizon)
+        carry = _ar2_carry(A, B, e_block)
         noise = sigma * jax.random.normal(key, sigma.shape)
-        return regression + carry + jnp.einsum("shj,soj->soh", weights, noise)
+        return regression + carry + jnp.einsum("shj,soj->soh", W, noise)
 
     chunk_fn = jax.jit(one_chunk)
     n_draws = e_origin.shape[0]
@@ -180,16 +258,14 @@ def decompose_horizon_variance(
     """Split the predictive variance at each horizon step into named sources.
 
     Conditional on one draw the h-step predictive is Gaussian with mean
-    ``x'beta + rho^(h+1) e_origin`` and variance ``sum_j rho^(2(h-j))
+    ``x'beta + A_h e_last + B_h e_prev`` and variance ``sum_j psi_{h-j}^2
     sigma_j^2``, so the law of total variance gives exactly two terms:
 
-    - ``parameter``: variance across draws of the conditional mean, all
-      the epistemic uncertainty there is, since the origin residual is
-      observed rather than filtered (the state term of the trend models is
-      structurally zero here);
+    - ``parameter``: variance across draws of the conditional mean, all the
+      epistemic uncertainty there is, since the origin residuals are observed
+      rather than filtered (there is no separate state term);
     - ``innovation``: mean across draws of the accumulated innovation
-      variance, the aleatoric noise playing the roles that process and
-      observation variance split between them under the trend models.
+      variance, the irreducible aleatoric noise.
 
     Returns
     -------
@@ -201,10 +277,11 @@ def decompose_horizon_variance(
     xv_future = jnp.asarray(xv_future)
 
     def one_chunk(block: dict[str, jnp.ndarray], e_block: jnp.ndarray):
+        rho1, rho2 = _ar2_coeffs(block)
         regression, sigma = _scales_and_regression(block, x_future, xv_future, bsts.heteroskedastic)
-        weights = _decay_weights(block["rho"], horizon)
-        carry = block["rho"][:, None, None] ** jnp.arange(1, horizon + 1) * e_block[:, :, None]
-        conditional_var = jnp.einsum("shj,soj->soh", weights**2, sigma**2)
+        A, B, W = _ar2_weights(rho1, rho2, horizon)
+        carry = _ar2_carry(A, B, e_block)
+        conditional_var = jnp.einsum("shj,soj->soh", W**2, sigma**2)
         return regression + carry, conditional_var
 
     chunk_fn = jax.jit(one_chunk)

@@ -1,16 +1,14 @@
 """ADVI fitting for the BSTS, with the ELBO decomposed as it trains.
 
-Two surrogate families share the training loop: a mean-field Gaussian
-(``AutoNormal``) and a full-rank Gaussian (``AutoMultivariateNormal``). Both
-operate in the unconstrained space induced by NumPyro's transforms.
+The surrogate is a full-rank Gaussian (``AutoMultivariateNormal``) in the
+unconstrained space induced by NumPyro's transforms.
 
 The logged decomposition uses ELBO = energy + entropy, where the energy is
 the expected log joint under the surrogate (including the Jacobian of the
 constraining transforms) and the entropy is the surrogate's differential
-entropy, available in closed form for both Gaussian families:
+entropy, available in closed form:
 
-    H = D/2 (1 + log 2 pi) + sum(log sigma_i)            (mean-field)
-    H = D/2 (1 + log 2 pi) + sum(log diag(L))            (full-rank)
+    H = D/2 (1 + log 2 pi) + sum(log diag(L))
 
 The ELBO itself is Monte-Carlo estimated with a larger particle count than
 the training gradient uses, and the energy follows by subtraction, so the
@@ -33,16 +31,14 @@ from nemforecastdemand.config import ViConfig
 from nemforecastdemand.evaluation.diagnostics import ElboTrace
 from nemforecastdemand.utils import tree_to_float32
 
-GUIDE_KINDS = ("meanfield", "fullrank")
+GUIDE_KINDS = ("fullrank",)
 
-#: Per-family optimisation settings. Both guides start at the prior medians:
-#: the default uniform(-2, 2) start can place the log-variance intercept deep
-#: in its clipped tail, where the initial loss is astronomically large and
-#: the first Adam steps blow the full-rank Cholesky apart. The full-rank
-#: factor also needs a halved learning rate and tight gradient clipping; the
-#: mean-field guide tolerates brisker settings.
+#: Optimisation settings. The guide starts at the prior medians: the default
+#: uniform(-2, 2) start can place the log-variance intercept deep in its
+#: clipped tail, where the initial loss is astronomically large and the first
+#: Adam steps blow the full-rank Cholesky apart, so the factor takes a halved
+#: learning rate and tight gradient clipping.
 GUIDE_SETTINGS = {
-    "meanfield": {"lr_scale": 1.0, "clip": 10.0, "init_scale": 0.1},
     "fullrank": {"lr_scale": 0.5, "clip": 1.0, "init_scale": 0.01},
 }
 
@@ -71,12 +67,11 @@ class ViFit:
 
 
 def make_guide(kind: str, model_fn: Callable, overrides: dict | None = None) -> autoguide.AutoGuide:
-    """Construct the surrogate family with a prior-median start."""
+    """Construct the full-rank surrogate with a prior-median start."""
     if kind not in GUIDE_SETTINGS:
         raise ValueError(f"unknown guide kind {kind!r}, expected one of {GUIDE_KINDS}")
     settings = {**GUIDE_SETTINGS[kind], **(overrides or {})}
-    cls = autoguide.AutoNormal if kind == "meanfield" else autoguide.AutoMultivariateNormal
-    return cls(
+    return autoguide.AutoMultivariateNormal(
         model_fn,
         init_loc_fn=init_to_median(num_samples=50),
         init_scale=settings["init_scale"],
@@ -84,19 +79,13 @@ def make_guide(kind: str, model_fn: Callable, overrides: dict | None = None) -> 
 
 
 def _gaussian_entropy(params: dict) -> jnp.ndarray:
-    """Entropy of the surrogate, covering both parameter layouts.
+    """Entropy of the surrogate.
 
-    AutoNormal stores one ``{site}_auto_loc`` and ``{site}_auto_scale`` pair
-    per latent site; AutoMultivariateNormal packs every latent into a single
-    ``auto_loc`` vector with a shared ``auto_scale_tril``.
+    AutoMultivariateNormal packs every latent into a single ``auto_loc``
+    vector with a shared ``auto_scale_tril``.
     """
-    if "auto_loc" in params:
-        dims = params["auto_loc"].size
-        log_scale = jnp.sum(jnp.log(jnp.diagonal(params["auto_scale_tril"])))
-    else:
-        scales = [value for name, value in params.items() if name.endswith("_auto_scale")]
-        dims = sum(scale.size for scale in scales)
-        log_scale = sum(jnp.sum(jnp.log(scale)) for scale in scales)
+    dims = params["auto_loc"].size
+    log_scale = jnp.sum(jnp.log(jnp.diagonal(params["auto_scale_tril"])))
     return 0.5 * dims * (1.0 + jnp.log(2.0 * jnp.pi)) + log_scale
 
 
@@ -115,7 +104,7 @@ def fit_advi(
         Zero-argument NumPyro model (data closed over), so every JIT trace
         is argument-free and compiles once.
     kind
-        ``meanfield`` or ``fullrank``.
+        Guide family; only ``fullrank`` is supported.
     vi
         Optimisation settings.
     seed
@@ -185,60 +174,34 @@ def fit_advi(
     )
 
 
-def _site_params(params: dict, suffix: str) -> dict[str, jnp.ndarray]:
-    return {
-        name.removesuffix(suffix): value for name, value in params.items() if name.endswith(suffix)
-    }
-
-
 def surrogate_mass_matrix(fit: ViFit) -> tuple[np.ndarray, np.ndarray, bool]:
     """Surrogate mean and covariance in NumPyro's flat latent ordering.
 
     NumPyro flattens the unconstrained latent dict with ``ravel_pytree``
-    (keys sorted). The mean-field guide already stores per-site parameters,
-    so flattening the site dict gives the right order directly; the
-    full-rank guide packs latents in its own order, so an index vector is
-    pushed through its unpacking to build the permutation.
+    (keys sorted). The full-rank guide packs latents in its own order, so an
+    index vector is pushed through its unpacking to build the permutation.
 
     Returns
     -------
     tuple
         ``(loc, inverse_mass, dense)``: the flat surrogate mean, the
-        surrogate variance vector (mean-field) or covariance matrix
-        (full-rank) to be used as the inverse mass matrix, and whether the
-        mass matrix is dense.
+        surrogate covariance matrix to be used as the dense inverse mass
+        matrix, and the dense flag, always ``True`` for the full-rank guide.
     """
-    if "auto_loc" in fit.params:
-        loc_packed = jnp.asarray(fit.params["auto_loc"])
-        index_dict = fit.guide._unpack_latent(jnp.arange(loc_packed.size))
-        perm, _ = jax.flatten_util.ravel_pytree(index_dict)
-        perm = np.asarray(perm, dtype=np.int64)
-        tril = np.asarray(fit.params["auto_scale_tril"], dtype=np.float64)
-        cov = tril @ tril.T
-        return np.asarray(loc_packed)[perm], cov[np.ix_(perm, perm)], True
-
-    locs = _site_params(fit.params, "_auto_loc")
-    scales = _site_params(fit.params, "_auto_scale")
-    loc_flat, _ = jax.flatten_util.ravel_pytree(locs)
-    scale_flat, _ = jax.flatten_util.ravel_pytree(scales)
-    return np.asarray(loc_flat), np.asarray(scale_flat) ** 2, False
+    loc_packed = jnp.asarray(fit.params["auto_loc"])
+    index_dict = fit.guide._unpack_latent(jnp.arange(loc_packed.size))
+    perm, _ = jax.flatten_util.ravel_pytree(index_dict)
+    perm = np.asarray(perm, dtype=np.int64)
+    tril = np.asarray(fit.params["auto_scale_tril"], dtype=np.float64)
+    cov = tril @ tril.T
+    return np.asarray(loc_packed)[perm], cov[np.ix_(perm, perm)], True
 
 
 def sample_unconstrained(fit: ViFit, seed: int, n_draws: int) -> dict[str, np.ndarray]:
     """Draw unconstrained latent dicts from the surrogate, for NUTS inits."""
     key = jax.random.PRNGKey(seed)
-    if "auto_loc" in fit.params:
-        loc = jnp.asarray(fit.params["auto_loc"])
-        eps = jax.random.normal(key, (n_draws, loc.size))
-        packed = loc + eps @ jnp.asarray(fit.params["auto_scale_tril"]).T
-        unpacked = jax.vmap(fit.guide._unpack_latent)(packed)
-        return {name: np.asarray(value) for name, value in unpacked.items()}
-
-    locs = _site_params(fit.params, "_auto_loc")
-    scales = _site_params(fit.params, "_auto_scale")
-    out = {}
-    for name, loc in locs.items():
-        key, subkey = jax.random.split(key)
-        eps = jax.random.normal(subkey, (n_draws, *loc.shape))
-        out[name] = np.asarray(loc + eps * scales[name])
-    return out
+    loc = jnp.asarray(fit.params["auto_loc"])
+    eps = jax.random.normal(key, (n_draws, loc.size))
+    packed = loc + eps @ jnp.asarray(fit.params["auto_scale_tril"]).T
+    unpacked = jax.vmap(fit.guide._unpack_latent)(packed)
+    return {name: np.asarray(value) for name, value in unpacked.items()}

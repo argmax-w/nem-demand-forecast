@@ -16,6 +16,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
+from nemforecastdemand import gates
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_gaussian
@@ -47,6 +48,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     panel = load_panel(cfg.paths.processed)
+    gates.validate_inputs(panel)  # fail hard before fitting on poisoned data
     splits = load_splits(cfg.paths.processed)
     max_lag = max(cfg.features.demand_lags)
 
@@ -150,6 +152,7 @@ def main() -> None:
     for name, forecasts in variants.items():
         arrays[f"{name}_mean"] = stack(forecasts, "mean")
         arrays[f"{name}_sd"] = stack(forecasts, "sd")
+    gates.check_forecast(mean=arrays["forecast_mean"], sd=arrays["forecast_sd"])
 
     meta = {
         "selection": selection,

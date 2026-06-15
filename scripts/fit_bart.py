@@ -28,6 +28,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from nemforecastdemand import gates
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_samples
@@ -64,6 +65,7 @@ def main() -> None:
     draws = args.draws if args.draws is not None else bart.draws
 
     panel = load_panel(cfg.paths.processed)
+    gates.validate_inputs(panel)  # fail hard before fitting on poisoned data
     splits = load_splits(cfg.paths.processed)
     max_lag = max(cfg.features.demand_lags)
     # The week-ago recency deviation reads one step behind the longest lag,
@@ -235,6 +237,7 @@ def main() -> None:
     for name, paths in variants.items():
         arrays[f"{name}_paths"] = paths.reshape(-1, n_origins, horizon)
         print(f"variant {name}: paths {arrays[f'{name}_paths'].shape}", flush=True)
+    gates.check_forecast(samples=arrays["forecast_paths"])  # withhold nonsense
 
     meta = {
         "sampler": "PGBART (particle Gibbs), two sum-of-trees heads (mean, log scale)",

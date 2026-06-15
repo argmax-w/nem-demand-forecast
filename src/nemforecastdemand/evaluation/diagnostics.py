@@ -3,9 +3,8 @@
 The ELBO splits as ELBO = energy + entropy, where the energy is the expected
 log joint under the surrogate and the entropy is the surrogate's own. The
 split separates "the surrogate found mass under the model" from "the
-surrogate stayed spread out", which is where mean-field's variance
-under-estimation shows up first: entropy collapses while the energy keeps
-rising.
+surrogate stayed spread out", so a surrogate that under-estimates its
+variance shows it here: entropy falls away while the energy keeps rising.
 
 MCMC health wraps ArviZ: split R-hat, bulk and tail ESS, divergence counts,
 E-BFMI and tree-depth saturation, summarised per parameter block so a five

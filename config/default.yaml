@@ -45,7 +45,34 @@ weather:
   # irradiance fields.
   forecast_model: ecmwf_ifs025
   lead_days: 1
-  variables: [temperature_2m, dew_point_2m, direct_normal_irradiance, diffuse_radiation]
+  # Modelled variables (actuals + day-ahead forecast). Apparent temperature,
+  # global horizontal irradiance and wind speed were added after the notebook
+  # 01 EDA showed they cut validation error in their transformed forms
+  # (apparent degree days, GHI, wind x heating); see eda_variables for the
+  # full candidate set that justification screened.
+  variables:
+    [
+      temperature_2m,
+      dew_point_2m,
+      direct_normal_irradiance,
+      diffuse_radiation,
+      apparent_temperature,
+      shortwave_radiation,
+      wind_speed_10m,
+    ]
+  # Candidate variables screened in the notebook 01 EDA (ERA5 actuals only);
+  # those that earned their place are promoted into variables above.
+  eda_variables:
+    [
+      apparent_temperature,
+      relative_humidity_2m,
+      wind_speed_10m,
+      wind_gusts_10m,
+      cloud_cover,
+      shortwave_radiation,
+      surface_pressure,
+      precipitation,
+    ]
   heating_base: 16.5 # degrees C, demand rises below this
   cooling_base: 20.5 # degrees C, demand rises above this
 
@@ -67,14 +94,12 @@ features:
 arima:
   # Candidate (p, d, q) orders for the regression residuals, selected on the
   # validation set. Seasonality and weather live in the exogenous regressors,
-  # so the residual process is kept low order and stationary.
+  # so the residual process is kept low order and stationary. The choice is
+  # between a first- and a second-order autoregression, the classical mirror
+  # of the BSTS AR([1,2]) error: the lag-2 term carries a slope at the origin.
   candidate_orders:
-    - [1, 0, 1]
-    - [2, 0, 1]
-    - [2, 0, 2]
-    - [3, 0, 1]
-    - [3, 0, 2]
-    - [4, 0, 2]
+    - [1, 0, 0]
+    - [2, 0, 0]
 
 # Bayesian additive regression trees: the Bayesian counterpart to the
 # LightGBM benchmark. Trees are discrete, so the model is fitted by its
@@ -86,7 +111,6 @@ bart:
   chains: 4
 
 bsts:
-  damped_slope: true
   obs_family: gaussian # gaussian | student_t
   # The observation scale is a log-linear function of a small daily basis and
   # the degree-day terms, so predictive variance follows the covariates. The
@@ -96,19 +120,13 @@ bsts:
   variance_daily_harmonics: 3
   variance_use_degree_days: true
   priors:
-    level_scale: 0.1 # HalfNormal, per-step level innovation
-    slope_scale: 0.01 # HalfNormal, per-step slope innovation
-    damping_alpha: 8.0 # Beta prior on the slope damping factor
-    damping_beta: 2.0
     coef_scale: 1.0 # Normal, regression coefficients
     obs_scale: 0.5 # HalfNormal, observation noise when homoskedastic
     var_intercept_loc: -1.5 # Normal, log observation scale at baseline
     var_intercept_scale: 0.7
     var_coef_scale: 0.25 # Normal, log-variance coefficients
-    init_level_scale: 2.0
-    init_slope_scale: 0.1
     student_t_df_rate: 0.1 # Exponential rate for (df - 2) under student_t
-    ar_alpha: 8.0 # Beta prior on the AR(1) error persistence (innovations form)
+    ar_alpha: 8.0 # Beta prior on phi1, the lag-1 partial autocorrelation of the AR(2) error
     ar_beta: 2.0
 
 vi:

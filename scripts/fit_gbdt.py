@@ -14,6 +14,7 @@ import argparse
 
 import numpy as np
 
+from nemforecastdemand import gates
 from nemforecastdemand.config import load_config
 from nemforecastdemand.data.loaders import load_panel, load_splits
 from nemforecastdemand.evaluation.metrics import crps_from_quantiles
@@ -39,6 +40,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     panel = load_panel(cfg.paths.processed)
+    gates.validate_inputs(panel)  # fail hard before fitting on poisoned data
     splits = load_splits(cfg.paths.processed)
     max_lag = max(cfg.features.demand_lags)
     test_origins = rolling_origins(
@@ -71,6 +73,10 @@ def main() -> None:
     for name, forecasts in variants.items():
         arrays[f"{name}_quantiles"] = stack_quantiles(forecasts)
         arrays[f"{name}_mean"] = stack_mean(forecasts)
+    # Output gate: quantiles level-first for the no-crossing check.
+    gates.check_forecast(
+        quantiles=arrays["forecast_quantiles"].transpose(1, 0, 2), mean=arrays["forecast_mean"]
+    )
 
     levels = np.asarray(model.quantiles)
     headline = np.mean(

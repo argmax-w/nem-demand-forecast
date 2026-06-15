@@ -67,6 +67,7 @@ class WeatherConfig:
     variables: tuple[str, ...]
     heating_base: float
     cooling_base: float
+    eda_variables: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,14 +84,6 @@ class FeatureConfig:
     # letting the temperature response and the weekend profile vary by
     # time of day. Zero disables the block.
     interaction_harmonics: int = 0
-    # Basis-function Gaussian process surface over time of day and
-    # temperature: a truncated spectral basis whose weight priors carry
-    # kernel structure in the model. Zero in either disables the block;
-    # only the HSGP variant of the Bayesian model enables it.
-    hsgp_time_harmonics: int = 0
-    hsgp_temp_basis: int = 0
-    hsgp_temp_lo: float = -5.0
-    hsgp_temp_hi: float = 45.0
 
 
 @dataclass(frozen=True)
@@ -104,19 +97,13 @@ class ArimaConfig:
 class BstsPriors:
     """Prior scales for the BSTS, on standardised demand."""
 
-    level_scale: float
-    slope_scale: float
-    damping_alpha: float
-    damping_beta: float
     coef_scale: float
     obs_scale: float
     var_intercept_loc: float
     var_intercept_scale: float
     var_coef_scale: float
-    init_level_scale: float
-    init_slope_scale: float
     student_t_df_rate: float
-    # Beta prior on the AR(1) error persistence in the innovations form.
+    # Beta prior on the AR(2) error's lag-1 partial autocorrelation (phi1).
     ar_alpha: float = 8.0
     ar_beta: float = 2.0
 
@@ -135,7 +122,6 @@ class BartConfig:
 class BstsConfig:
     """Structural model settings."""
 
-    damped_slope: bool
     obs_family: str
     heteroskedastic: bool
     variance_daily_harmonics: int
@@ -276,6 +262,7 @@ def load_config(path: str | Path | None = None) -> Config:
             variables=tuple(raw["weather"]["variables"]),
             heating_base=float(raw["weather"]["heating_base"]),
             cooling_base=float(raw["weather"]["cooling_base"]),
+            eda_variables=tuple(raw["weather"].get("eda_variables", ())),
         ),
         features=FeatureConfig(
             seasonal_basis=raw["features"]["seasonal_basis"],
@@ -296,7 +283,6 @@ def load_config(path: str | Path | None = None) -> Config:
             chains=int(raw["bart"]["chains"]),
         ),
         bsts=BstsConfig(
-            damped_slope=bool(raw["bsts"]["damped_slope"]),
             obs_family=raw["bsts"]["obs_family"],
             heteroskedastic=bool(raw["bsts"]["heteroskedastic"]),
             variance_daily_harmonics=int(raw["bsts"]["variance_daily_harmonics"]),

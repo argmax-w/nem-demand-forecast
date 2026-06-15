@@ -74,6 +74,9 @@ def weather_columns(panel: pd.DataFrame, source: str) -> pd.DataFrame:
             "dew_c": panel[f"dew{suffix}_c"],
             "dni_wm2": panel[f"dni{suffix}_wm2"],
             "dhi_wm2": panel[f"dhi{suffix}_wm2"],
+            "apptemp_c": panel[f"apptemp{suffix}_c"],
+            "ghi_wm2": panel[f"ghi{suffix}_wm2"],
+            "wind_kmh": panel[f"wind{suffix}_kmh"],
         }
     ).astype(np.float64)
 
@@ -110,10 +113,22 @@ def build_design(
         weather.loc[overrides.index, overrides.columns] = overrides
 
     degrees = degree_days(weather["temp_c"], cfg.weather.heating_base, cfg.weather.cooling_base)
+    # EDA-justified weather terms (notebook 01): apparent-temperature degree
+    # days (humidity and wind folded into 'feels like'), GHI as a raw column
+    # for behind-the-meter PV, and wind speed interacted with heating degrees
+    # for cold-day heat loss. The raw apparent temperature and wind speed are
+    # dropped: only these transforms earned their place on validation.
+    app_degrees = degree_days(
+        weather["apptemp_c"], cfg.weather.heating_base, cfg.weather.cooling_base
+    ).add_suffix("_app")
+    wind_heat = (weather["wind_kmh"] * degrees["heating_deg"]).rename("wind_heat")
+    raw_weather = weather[["temp_c", "dew_c", "dni_wm2", "dhi_wm2", "ghi_wm2"]]
     blocks = [
         seasonal_design(panel.index, cfg.features),
-        weather,
+        raw_weather,
         degrees,
+        app_degrees,
+        wind_heat.to_frame(),
         pd.DataFrame(
             {f"demand_lag{lag}": panel["demand_mw"].shift(lag) for lag in cfg.features.demand_lags}
         ),
@@ -134,22 +149,20 @@ def build_design(
             interactions[f"heating_{column}"] = degrees["heating_deg"] * basis[column]
             interactions[f"weekend_{column}"] = weekend * basis[column]
         blocks.append(pd.DataFrame(interactions, index=panel.index))
-    if cfg.features.hsgp_time_harmonics > 0 and cfg.features.hsgp_temp_basis > 0:
-        from nemforecastdemand.models.hsgp import gp_design
-
-        blocks.append(gp_design(panel.index, weather["temp_c"], cfg.features))
     return pd.concat(blocks, axis=1).astype(np.float64)
 
 
 def recency_features(panel: pd.DataFrame, origin: pd.Timestamp, horizon: int) -> pd.DataFrame:
     """Origin-anchored features carrying the AR(1) information set to trees.
 
-    The time-series models condition on the residual at the forecast origin
-    through their error dynamics; a direct regression sees one row per
-    target time and cannot. These three columns close that gap: how far the
-    last observed half hour sits above its day-ago and week-ago values, and
-    how many steps ahead the target is, from which trees can learn a
-    decaying correction. Everything is computed strictly before the origin.
+    The time-series models condition on the residuals at the forecast origin
+    through their error dynamics; a direct regression sees one row per target
+    time and cannot. These columns close that gap: how far the last observed
+    half hour sits above its day-ago and week-ago values, the recent slope
+    and curvature (first and second differences at the origin, the trees'
+    analogue of the AR(2) error carrying a level and a slope forward), and
+    how many steps ahead the target is, from which trees can learn a decaying
+    correction. Everything is computed strictly before the origin.
     """
     index = horizon_index(origin, horizon)
     demand = panel["demand_mw"]
@@ -160,6 +173,10 @@ def recency_features(panel: pd.DataFrame, origin: pd.Timestamp, horizon: int) ->
             "horizon_step": np.arange(horizon, dtype=np.float64),
             "dev_day": float(demand.loc[last] - demand.loc[last - 48 * step]),
             "dev_week": float(demand.loc[last] - demand.loc[last - 336 * step]),
+            "dev_slope": float(demand.loc[last] - demand.loc[last - step]),
+            "dev_curve": float(
+                demand.loc[last] - 2.0 * demand.loc[last - step] + demand.loc[last - 2 * step]
+            ),
         },
         index=index,
     )

@@ -8,8 +8,8 @@ statistics alongside the trace plots.
 
 The warm start seeds two things from a fitted ADVI surrogate: the initial
 position of every chain, drawn from q, and the inverse mass matrix, taken as
-the surrogate covariance (diagonal from mean-field, dense from full-rank)
-with mass adaptation frozen. Step-size adaptation stays on; it is cheap and
+the surrogate covariance (dense, from the full-rank guide) with mass
+adaptation frozen. Step-size adaptation stays on; it is cheap and
 absorbs any global misscaling of the surrogate. The honest comparison
 against the cold run happens at matched quality in the analysis: total
 wall-clock to a target bulk ESS with clean R-hat, never raw wall-clock at

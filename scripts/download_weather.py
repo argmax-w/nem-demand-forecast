@@ -53,6 +53,17 @@ def main() -> None:
         f"{len(forecast)} hours, {missing} with gaps"
     )
 
+    # Candidate ERA5 actuals for the notebook 01 variable-selection EDA. Only
+    # the variables that earned their place there are promoted into
+    # cfg.weather.variables above; the rest are screened and rejected.
+    if cfg.weather.eda_variables:
+        candidates = weather.fetch_era5(
+            point.latitude, point.longitude, start, end, cfg.weather.eda_variables,
+            cfg.weather.actuals_model,
+        )
+        weather.save_raw(candidates, raw_dir / "era5_candidates.parquet")
+        print(f"EDA candidates: {len(candidates)} hours, {len(candidates.columns)} variables")
+
 
 if __name__ == "__main__":
     main()
