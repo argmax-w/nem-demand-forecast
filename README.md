@@ -120,8 +120,6 @@ season at once is hard; the ranking is the story.
 
 ![CRPS by lead time](reports/figures/horizon_crps_all_models.png)
 
-![Warm-start accounting](reports/figures/warm_start_accounting.png)
-
 ## Repository layout
 
 - `src/nemforecastdemand/`: the package. `data/` (AEMO and Open-Meteo loaders),
