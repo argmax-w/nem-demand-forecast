@@ -135,6 +135,18 @@ def main() -> None:
     with timed("naive_forecasts", timings):
         naive_forecasts = [naive.forecast(panel, origin) for origin in test_origins]
 
+    # Coherent sample paths for the headline forecast variant, so the energy
+    # score over whole 48-step days exists for the classical baseline too. Each
+    # origin draws its own seed, so the paths are reproducible and independent.
+    arima_paths = 1000  # matches the sample models' draw count, for a like-for-like energy score
+    with timed("forecast_paths", timings):
+        forecast_paths = np.stack(
+            [
+                model.simulate_paths(panel, origin, "forecast", arima_paths, seed=cfg.seed + i)
+                for i, origin in enumerate(test_origins)
+            ]
+        ).transpose(1, 0, 2)  # (paths, origins, horizon)
+
     arrays = {
         "origins_val": val_origins.asi8,
         "origins_test": test_origins.asi8,
@@ -152,7 +164,15 @@ def main() -> None:
     for name, forecasts in variants.items():
         arrays[f"{name}_mean"] = stack(forecasts, "mean")
         arrays[f"{name}_sd"] = stack(forecasts, "sd")
+    arrays["forecast_paths"] = forecast_paths.astype(np.float32)
     gates.check_forecast(mean=arrays["forecast_mean"], sd=arrays["forecast_sd"])
+
+    # The simulated paths must reproduce the analytic per-step spread; a large
+    # gap would mean the joint draw is mis-scaled rather than just Monte-Carlo
+    # noisy. With 1000 paths a few percent is expected.
+    sim_sd = forecast_paths.std(axis=0)
+    rel = np.abs(sim_sd - arrays["forecast_sd"]) / arrays["forecast_sd"]
+    print(f"simulated vs analytic per-step sd: mean {rel.mean():.1%}, max {rel.max():.1%}")
 
     meta = {
         "selection": selection,

@@ -50,7 +50,7 @@ the Bayesian machinery brings and what it costs.
 | Dynamic harmonic regression + AR(1) errors | analytic Gaussian | classical baseline |
 | LightGBM, 15 quantile heads | regularised quantiles | industry benchmark |
 | BART, two heads (mean and log scale) | posterior predictive draws | Bayesian trees against LightGBM |
-| BSTS: regression with a heteroskedastic AR(2) error | posterior predictive paths | the Bayesian forecaster |
+| BSTS: regression with a heteroskedastic AR([1,2]) error | posterior predictive paths | the Bayesian forecaster |
 
 Every model reads one shared design matrix: local-clock seasonal harmonics,
 temperature, dew point, irradiance, degree days, demand lags and holidays. The
@@ -70,8 +70,8 @@ heteroskedastic, growing and shrinking with the hour of day, as the EDA asks.
    reanalysis and archived ECMWF IFS forecasts; cleansing, timezone checks, the
    non-linear structure, and the committed season-blocked splits. Choosing the
    ARIMA order on validation gives the classical baseline.
-2. **The BSTS** (notebook 03). A seasonal regression with a stationary AR(2) error
-   and a heteroskedastic scale, fitted by full-rank ADVI. The likelihood is written
+2. **The BSTS** (notebook 03). A seasonal regression with a stationary AR([1,2])
+   error and a heteroskedastic scale, fitted by full-rank ADVI. The likelihood is written
    on the innovations, so there is no sequential scan and it fits in seconds, and it
    leads the field on log score and short-lead sharpness.
 3. **Inference** (notebook 04). From cold starts NUTS wanders into degenerate
@@ -85,9 +85,9 @@ heteroskedastic, growing and shrinking with the hour of day, as the EDA asks.
    the year and the compute bill.
 5. **Head to head** (notebook 06). The two strongest models win on different
    things: LightGBM takes the lower marginal CRPS and a simpler fit; the BSTS is
-   sharper at short lead and is the only one producing coherent 48-step scenarios, a
-   full density, and a split of its uncertainty into the part more data would remove
-   and the part it would not.
+   sharper at short lead and produces the coherent 48-step scenarios LightGBM
+   cannot, a full density, and a split of its uncertainty into the part more data
+   would remove and the part it would not.
 6. **Operations** (notebook 07). The BSTS as a control-room forecaster on a real
    winter peak: the live forecast, how it sharpens across intraday re-issues, the
    probability of a spike against the record, and the ramp, stress-duration and
@@ -109,8 +109,7 @@ evaluation months, from [notebook 05](notebooks/05_model_comparison.ipynb):
 
 The BSTS posts the best log score (7.47 against ARIMA's 7.62, paired bootstrap
 p < 0.001) and the best calibration, its 50 percent interval covering almost
-exactly 50 percent of outcomes, and it wins the energy score over whole paths,
-which only a coherent joint predictive can earn. LightGBM takes the single-number
+exactly 50 percent of outcomes. LightGBM takes the single-number
 CRPS by a wide margin (200 MW) but carries no density, so it has no log score, and
 its intervals are overconfident, the nominal 90 percent band catching only 77
 percent. ARIMA edges the BSTS on overall CRPS (258 against 272, p = 0.02) by

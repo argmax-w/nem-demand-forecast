@@ -9,7 +9,10 @@ be a serious operational candidate.
 The residual order is selected on the validation set (notebook 02). The
 fitted Gaussian state-space model yields an analytic Gaussian predictive,
 scored with the closed-form CRPS, which doubles as the correctness reference
-for the sample-based estimator used by the Bayesian models.
+for the sample-based estimator used by the Bayesian models. Because that
+predictive is a joint Gaussian over the whole horizon, the model can also
+simulate coherent sample paths, so the energy score over whole days is
+defined for the classical baseline too.
 
 Forecasting from an origin re-applies the fitted parameters to all demand
 history up to that origin (a Kalman filter pass, no refit), with realised
@@ -113,3 +116,49 @@ class DynamicHarmonicRegression(Forecaster):
         mean = prediction.predicted_mean.to_numpy() * self._y_scale + self._y_loc
         sd = np.sqrt(prediction.var_pred_mean.to_numpy()) * self._y_scale
         return Forecast(origin=origin, index=index, mean=mean, sd=sd)
+
+    def simulate_paths(
+        self,
+        panel: pd.DataFrame,
+        origin: pd.Timestamp,
+        weather_source: str = "forecast",
+        n_paths: int = 1000,
+        seed: int = 0,
+        overrides: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        """Coherent predictive sample paths over the horizon, ``(n_paths, H)`` in MW.
+
+        The fitted state-space model is a joint Gaussian over the 48 steps, not a
+        stack of per-step marginals. Simulating forward from the filtered
+        end-of-sample state with fresh innovations therefore draws whole-day
+        trajectories whose cross-step dependence is the AR error's own. The
+        marginal mean and variance of these paths match the analytic
+        ``get_forecast`` predictive; what they add is the joint law a sample-only
+        score such as the energy score needs.
+        """
+        if self._results is None:
+            raise RuntimeError("fit the model first")
+        index = horizon_index(origin, self.cfg.horizon)
+
+        history = panel.index[(panel.index >= self._fit_start) & (panel.index < origin)]
+        design_history = build_design(panel, self.cfg, weather_source="actual").loc[history]
+        design_future = build_design(
+            panel, self.cfg, weather_source=weather_source, overrides=overrides
+        ).loc[index]
+
+        y_history = (
+            panel["demand_mw"].loc[history].astype(np.float64) - self._y_loc
+        ) / self._y_scale
+        y_history.index.freq = "30min"
+        applied = self._results.apply(
+            y_history, exog=self._standardise_design(design_history), refit=False
+        )
+        sim = applied.simulate(
+            nsimulations=self.cfg.horizon,
+            anchor="end",
+            exog=self._standardise_design(design_future),
+            repetitions=n_paths,
+            random_state=seed,
+        )
+        paths = np.asarray(sim, dtype=np.float64).reshape(self.cfg.horizon, n_paths).T
+        return paths * self._y_scale + self._y_loc
