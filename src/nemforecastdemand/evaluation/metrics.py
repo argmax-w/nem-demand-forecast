@@ -166,6 +166,46 @@ def log_score_samples(y: np.ndarray, draws: np.ndarray) -> np.ndarray:
     return log_score_gaussian(y, mean, sd)
 
 
+def rb_log_score(
+    y: np.ndarray, draw_mean: np.ndarray, draw_sd: np.ndarray, chunk: int = 1024
+) -> np.ndarray:
+    """Rao-Blackwellised negative log predictive density.
+
+    The exact mixture log density ``-log mean_j N(y_i; mu_ij, sigma_ij)``
+    where each draw contributes an analytic Gaussian, so the observation
+    noise is integrated out rather than approximated by one matched Gaussian
+    (:func:`log_score_samples`) or estimated from replicates. Evaluated with
+    a log-sum-exp over draws for stability and streamed over observations.
+
+    Parameters
+    ----------
+    y
+        Observations, shape ``(N,)``.
+    draw_mean, draw_sd
+        Per-draw predictive moments, shape ``(S, N)``.
+    chunk
+        Observations per block.
+
+    Returns
+    -------
+    numpy.ndarray
+        Negative log predictive density per observation, shape ``(N,)``.
+    """
+    from scipy.special import logsumexp
+
+    y = np.asarray(y, dtype=np.float64)
+    mean = np.asarray(draw_mean, dtype=np.float64)
+    sd = np.asarray(draw_sd, dtype=np.float64)
+    n_draws = mean.shape[0]
+    n = y.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in range(0, n, chunk):
+        sl = slice(i, min(i + chunk, n))
+        logp = stats.norm.logpdf(y[None, sl], loc=mean[:, sl], scale=sd[:, sl])
+        out[sl] = -(logsumexp(logp, axis=0) - np.log(n_draws))
+    return out
+
+
 def pinball_loss(
     y: np.ndarray, quantile_forecasts: np.ndarray, quantiles: np.ndarray
 ) -> np.ndarray:

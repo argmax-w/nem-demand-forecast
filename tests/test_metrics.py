@@ -4,12 +4,23 @@ import numpy as np
 from scipy import stats
 
 from nemforecastdemand.evaluation.calibration import (
+    averaged_gaussian_pdf,
+    ecdf_uniform_band,
+    pit_ecdf_difference,
     pit_gaussian,
     pit_histogram,
     pit_samples,
+    predictive_band_from_moments,
+    rb_pit,
     reliability_table,
+    stratified_pit,
 )
-from nemforecastdemand.evaluation.diagnostics import ElboTrace, sampler_health, time_to_target_ess
+from nemforecastdemand.evaluation.diagnostics import (
+    ElboTrace,
+    diagnostic_status_table,
+    sampler_health,
+    time_to_target_ess,
+)
 from nemforecastdemand.evaluation.metrics import (
     crps_from_quantiles,
     crps_gaussian,
@@ -20,6 +31,7 @@ from nemforecastdemand.evaluation.metrics import (
     mase,
     paired_bootstrap_difference,
     pinball_loss,
+    rb_log_score,
 )
 
 
@@ -128,6 +140,86 @@ def test_pit_samples_near_uniform():
     draws = rng.normal(size=(500, 2000))
     pit = pit_samples(y, draws)
     assert abs(pit.mean() - 0.5) < 0.03
+
+
+def test_rb_pit_reduces_to_gaussian_for_one_draw():
+    rng = np.random.default_rng(40)
+    y = rng.normal(2.0, 3.0, 500)
+    one = rb_pit(y, np.full((1, 500), 2.0), np.full((1, 500), 3.0))
+    np.testing.assert_allclose(one, pit_gaussian(y, 2.0, 3.0), atol=1e-12)
+
+
+def test_rb_pit_uniform_under_calibration():
+    rng = np.random.default_rng(41)
+    n, s = 4000, 600
+    mean = rng.normal(0.0, 1.0, (s, n))  # epistemic spread
+    sd = np.full((s, n), 1.5)
+    idx = rng.integers(0, s, n)
+    y = mean[idx, np.arange(n)] + sd[idx, np.arange(n)] * rng.normal(size=n)
+    pit = rb_pit(y, mean, sd)
+    assert abs(pit.mean() - 0.5) < 0.02
+    assert abs(pit.std() - np.sqrt(1.0 / 12.0)) < 0.02
+
+
+def test_averaged_gaussian_pdf_integrates_to_one():
+    rng = np.random.default_rng(42)
+    mean = rng.normal(0.0, 1.0, (300, 4))
+    sd = np.full((300, 4), 0.8)
+    grid = np.linspace(-8.0, 8.0, 1000)
+    field = averaged_gaussian_pdf(grid, mean, sd)
+    integral = np.trapezoid(field, grid, axis=1)
+    np.testing.assert_allclose(integral, 1.0, atol=1e-3)
+
+
+def test_predictive_band_inverts_to_analytic_quantiles():
+    mean = np.full((1, 3), 10.0)
+    sd = np.full((1, 3), 2.0)
+    band = predictive_band_from_moments(np.array([0.05, 0.5, 0.95]), mean, sd, n_grid=4000)
+    exact = stats.norm.ppf([0.05, 0.5, 0.95], 10.0, 2.0)
+    np.testing.assert_allclose(band[:, 0], exact, atol=0.02)
+
+
+def test_rb_log_score_reduces_to_gaussian_for_one_draw():
+    y = np.array([1.5, -0.5])
+    mean, sd = np.array([1.0, 0.0]), np.array([2.0, 1.0])
+    one = rb_log_score(y, mean[None, :], sd[None, :])
+    np.testing.assert_allclose(one, log_score_gaussian(y, mean, sd))
+
+
+def test_ecdf_band_and_difference():
+    rng = np.random.default_rng(43)
+    pit = rng.uniform(size=3000)
+    x, diff = pit_ecdf_difference(pit)
+    assert x.shape == diff.shape == (3000,)
+    band = ecdf_uniform_band(3000)
+    assert np.abs(diff).max() < band  # a calibrated sample stays inside the band
+    assert ecdf_uniform_band(200) > ecdf_uniform_band(5000)  # tighter with more data
+
+
+def test_stratified_pit_partitions():
+    pit = np.arange(6, dtype=float)
+    strata = np.array(["a", "b", "a", "b", "a", "b"])
+    parts = stratified_pit(pit, strata)
+    np.testing.assert_array_equal(parts["a"], [0.0, 2.0, 4.0])
+    np.testing.assert_array_equal(parts["b"], [1.0, 3.0, 5.0])
+
+
+def test_diagnostic_status_thresholds():
+    import pandas as pd
+
+    good = diagnostic_status_table(
+        pd.DataFrame({"max_rhat": [1.004], "min_bulk_ess": [2200], "min_tail_ess": [1800]}),
+        pd.DataFrame({"divergences": [0, 0], "e_bfmi": [0.9, 0.95]}),
+    )
+    assert (good["status"] == "green").all()
+    bad = diagnostic_status_table(
+        pd.DataFrame({"max_rhat": [1.05], "min_bulk_ess": [120], "min_tail_ess": [150]}),
+        pd.DataFrame({"divergences": [12, 3], "e_bfmi": [0.2, 0.5]}),
+    )
+    assert bad.loc["split R-hat (max)", "status"] == "red"
+    assert bad.loc["bulk-ESS (min)", "status"] == "red"
+    assert bad.loc["divergences (total)", "status"] == "red"
+    assert bad.loc["E-BFMI (min)", "status"] == "red"
 
 
 def test_reliability_table():

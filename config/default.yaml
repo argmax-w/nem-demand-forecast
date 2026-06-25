@@ -75,6 +75,12 @@ weather:
     ]
   heating_base: 16.5 # degrees C, demand rises below this
   cooling_base: 20.5 # degrees C, demand rises above this
+  # Piecewise-linear temperature spline (hinge knots, degrees C) for the convex
+  # demand-temperature response, and trailing-degree-day windows (half-hour
+  # steps: 24 h and 48 h) for thermal inertia. Both selected on validation
+  # (notebook 01); shared by every model through the design.
+  temperature_spline_knots: [10.5, 18.5, 25.65]
+  thermal_windows: [48, 96]
 
 features:
   # Seasonal basis for the daily and weekly cycles. The RBF counts are chosen

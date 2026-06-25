@@ -121,6 +121,69 @@ def sampler_health(extra_fields: dict[str, np.ndarray], max_tree_depth: int) -> 
     )
 
 
+def _rhat_status(value: float) -> str:
+    if value < 1.01:
+        return "green"
+    return "amber" if value < 1.02 else "red"
+
+
+def _ess_status(value: float) -> str:
+    if value > 400.0:
+        return "green"
+    return "amber" if value >= 200.0 else "red"
+
+
+def _divergence_status(count: int) -> str:
+    if count == 0:
+        return "green"
+    return "amber" if count <= 5 else "red"
+
+
+def _ebfmi_status(value: float) -> str:
+    return "green" if value > 0.3 else "red"
+
+
+def diagnostic_status_table(site_summary: pd.DataFrame, chain_health: pd.DataFrame) -> pd.DataFrame:
+    """Worst-case diagnostics with a green/amber/red status per row.
+
+    Collapses the per-site convergence summary and the per-chain sampler
+    health into one compact traffic-light table: the worst split R-hat, the
+    smallest bulk and tail ESS, the total divergence count and the smallest
+    E-BFMI, each classified against the standard thresholds. Status is the
+    reserved pass/inspect/fail axis, never reused for a model or parameter.
+
+    Parameters
+    ----------
+    site_summary
+        Per-site frame with ``max_rhat``, ``min_bulk_ess`` and
+        ``min_tail_ess`` (as :func:`mcmc_summary` returns).
+    chain_health
+        Per-chain frame with ``divergences`` and ``e_bfmi`` (as
+        :func:`sampler_health` returns).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by diagnostic, with ``value`` and ``status`` columns.
+    """
+    max_rhat = float(site_summary["max_rhat"].max())
+    min_bulk = float(site_summary["min_bulk_ess"].min())
+    min_tail = float(site_summary["min_tail_ess"].min())
+    total_div = int(chain_health["divergences"].sum())
+    min_ebfmi = float(chain_health["e_bfmi"].min())
+    rows = [
+        ("split R-hat (max)", max_rhat, _rhat_status(max_rhat)),
+        ("bulk-ESS (min)", min_bulk, _ess_status(min_bulk)),
+        ("tail-ESS (min)", min_tail, _ess_status(min_tail)),
+        ("divergences (total)", float(total_div), _divergence_status(total_div)),
+        ("E-BFMI (min)", min_ebfmi, _ebfmi_status(min_ebfmi)),
+    ]
+    return pd.DataFrame(
+        {"value": [r[1] for r in rows], "status": [r[2] for r in rows]},
+        index=pd.Index([r[0] for r in rows], name="diagnostic"),
+    )
+
+
 def time_to_target_ess(
     warmup_seconds: float,
     sampling_seconds: float,

@@ -51,12 +51,18 @@ def predict_variants_innovations(
     cfg: Config,
     origins: pd.DatetimeIndex,
     perturbations: dict[str, object],
-) -> tuple[dict[str, np.ndarray], np.ndarray]:
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, np.ndarray]]:
     """Predictive path samples per variant for the innovations-form model.
 
     The AR(2) error is second-order Markov, so each draw only needs its
     regression residuals at the two steps before each origin; the horizons
     then follow in closed form from the AR(2) impulse response.
+
+    Returns the per-variant path samples, the observed paths, and the
+    per-draw Gaussian predictive moments for the forecast-weather variant
+    (``forecast_path_mean`` and ``forecast_path_sd``, each ``(S, O, H)`` in
+    megawatts), which let the headline predictive be scored and drawn
+    Rao-Blackwellised rather than from sampled replicates.
     """
     history = panel.index[
         (panel.index >= inputs.index[0]) & (panel.index <= origins[-1] + pd.Timedelta("23.5h"))
@@ -90,11 +96,28 @@ def predict_variants_innovations(
         return (paths * inputs.y_scale + inputs.y_loc).astype(np.float32)
 
     variants: dict[str, np.ndarray] = {}
-    variants["forecast"] = simulate(
-        [design_forecast.loc[index] for index in horizons],
-        [vdesign_forecast.loc[index] for index in horizons],
-        seed=cfg.seed + 1,
+    fc_blocks = [design_forecast.loc[index] for index in horizons]
+    fc_vblocks = [vdesign_forecast.loc[index] for index in horizons]
+    variants["forecast"] = simulate(fc_blocks, fc_vblocks, seed=cfg.seed + 1)
+
+    # Per-draw analytic moments for the headline (forecast-weather) variant,
+    # so the predictive can be Rao-Blackwellised: density, bands, PIT and log
+    # score average analytic Gaussians over draws rather than sampling.
+    fc_transformed = [
+        bsts.transform_design(inputs, b, v) for b, v in zip(fc_blocks, fc_vblocks, strict=True)
+    ]
+    mean_std, sd_std = innovations.horizon_path_moments(
+        hyper_draws,
+        e_origin,
+        np.stack([x for x, _ in fc_transformed]),
+        np.stack([z for _, z in fc_transformed]),
+        cfg.bsts,
     )
+    moments = {
+        "forecast_path_mean": (mean_std * inputs.y_scale + inputs.y_loc).astype(np.float32),
+        "forecast_path_sd": (sd_std * inputs.y_scale).astype(np.float32),
+    }
+
     variants["actual"] = simulate(
         [design_actual.loc[index] for index in horizons],
         [vdesign_actual.loc[index] for index in horizons],
@@ -112,7 +135,7 @@ def predict_variants_innovations(
             blocks.append(block)
             vblocks.append(vblock)
         variants[f"perturb_{multiplier:g}"] = simulate(blocks, vblocks, seed=cfg.seed + 3 + j)
-    return variants, y_true
+    return variants, y_true, moments
 
 
 def variance_decomposition_innovations(

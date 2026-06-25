@@ -122,6 +122,29 @@ def build_design(
         weather["apptemp_c"], cfg.weather.heating_base, cfg.weather.cooling_base
     ).add_suffix("_app")
     wind_heat = (weather["wind_kmh"] * degrees["heating_deg"]).rename("wind_heat")
+    # Convex temperature response and thermal inertia (notebook 02, selected on
+    # validation, shared by every model). The hinge spline lets the demand-
+    # temperature curve bend up at the extremes that piecewise-linear degree days
+    # under-call; the trailing degree-days carry the thermal mass, so demand on a
+    # sustained cold or hot spell exceeds a single cold or hot half hour. Both are
+    # pointwise or strictly backward-looking, so no row sees beyond its timestamp.
+    spline = pd.DataFrame(
+        {
+            f"temp_hinge{j}": np.maximum(0.0, weather["temp_c"] - knot)
+            for j, knot in enumerate(cfg.weather.temperature_spline_knots)
+        },
+        index=panel.index,
+    )
+    thermal = pd.DataFrame(
+        {
+            f"{kind}_roll{window // 2}h": degrees[f"{kind}_deg"]
+            .rolling(window, min_periods=1)
+            .mean()
+            for window in cfg.weather.thermal_windows
+            for kind in ("cooling", "heating")
+        },
+        index=panel.index,
+    )
     raw_weather = weather[["temp_c", "dew_c", "dni_wm2", "dhi_wm2", "ghi_wm2"]]
     blocks = [
         seasonal_design(panel.index, cfg.features),
@@ -129,6 +152,8 @@ def build_design(
         degrees,
         app_degrees,
         wind_heat.to_frame(),
+        spline,
+        thermal,
         pd.DataFrame(
             {f"demand_lag{lag}": panel["demand_mw"].shift(lag) for lag in cfg.features.demand_lags}
         ),

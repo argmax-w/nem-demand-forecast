@@ -18,11 +18,17 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Patch
 
 from nemforecastdemand.config import load_config
 from nemforecastdemand.evaluation.metrics import crps_samples
-from nemforecastdemand.plotting import DISPLAY_TZ, MODEL_COLOURS, save_figure, setup_style
+from nemforecastdemand.plotting import (
+    DISPLAY_TZ,
+    MODEL_COLOURS,
+    density_ribbon,
+    save_figure,
+    sequential_cmap,
+    setup_style,
+)
 from nemforecastdemand.utils import load_artifact
 
 # The two days the README leads on, chosen by hand off the test set:
@@ -34,7 +40,6 @@ from nemforecastdemand.utils import load_artifact
 FAN_ORIGIN = 20
 SCENARIO_ORIGIN = 17
 N_SCENARIOS = 30
-BANDS = [(0.025, 0.975, 0.15, "95%"), (0.1, 0.9, 0.24, "80%"), (0.25, 0.75, 0.34, "50%")]
 
 
 def _clock(origin: pd.Timestamp, horizon: int) -> pd.DatetimeIndex:
@@ -63,21 +68,22 @@ def main() -> None:
     quantiles = gbdt["forecast_quantiles"]  # (O, Q, H), LightGBM's per-step marginals
     levels = np.array(gbdt_meta["quantile_levels"])
 
-    # --- 1. A calibrated day-ahead fan against the observed -------------------
+    # --- 1. A calibrated day-ahead density field against the observed ---------
     i = FAN_ORIGIN
     times = _clock(origins[i], horizon)
     day = times[0].strftime("%a %d %b %Y")
     crps = crps_samples(y[i], paths[:, i, :]).mean()
 
     fig, ax = plt.subplots(figsize=(9, 4.6))
-    handles = []
-    for lo, hi, alpha, name in BANDS:
-        blo, bhi = np.quantile(paths[:, i, :], [lo, hi], axis=0)
-        ax.fill_between(times, blo, bhi, color=colour, alpha=alpha, lw=0)
-        handles.append(Patch(facecolor=colour, alpha=alpha, label=f"{name} interval"))
-    median_path = np.median(paths[:, i, :], axis=0)
-    (median,) = ax.plot(times, median_path, color=colour, lw=1.7, label="median forecast")
-    (obs,) = ax.plot(times, y[i], color="black", lw=1.7, label="observed")
+    density_ribbon(
+        ax,
+        times,
+        draw_mean=ar["forecast_path_mean"][:, i, :],
+        draw_sd=ar["forecast_path_sd"][:, i, :],
+        observed=y[i],
+        cmap=sequential_cmap(colour),
+        label="median forecast",
+    )
     _time_axis(ax)
     ax.set_title(f"Day-ahead BSTS forecast for NSW1 demand, {day}")
     ax.annotate(
@@ -88,7 +94,7 @@ def main() -> None:
         fontsize=9,
         color="0.3",
     )
-    ax.legend(handles=[obs, median, *handles], loc="upper left", fontsize=8, ncol=2)
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
     save_figure(fig, "readme_forecast_fan", cfg.paths.figures)
 
     # --- 2. Coherent BSTS paths vs LightGBM's independent marginals ----------

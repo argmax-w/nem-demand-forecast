@@ -11,58 +11,84 @@ half hour by half hour.
 ![Day-ahead BSTS forecast for NSW1 demand](reports/figures/readme_forecast_fan.png)
 
 One test day, called from its midnight origin off the weather forecast on hand the
-day before. The black line is what arrived, the amber line the median, the bands
-the central 50, 80 and 95 percent. The observed day stays inside the bands
-throughout, tight overnight and widening across the 18:00 peak where the call is
-hardest. An operator does not want the single most likely number for the peak,
-they want to know how high the tail could reach, and a calibrated density is what
-tells them.
+day before.
+
+- Black line: the demand that arrived. Amber line: the predictive median.
+- The colour is the predictive density, deepest where tomorrow's demand is most
+  likely, with the central 50 and 90 percent intervals as dotted lines.
+- The observed day stays inside the bands throughout, tight overnight and widening
+  across the 18:00 peak where the call is hardest.
+
+An operator does not want the single most likely number for the peak, they want to
+know how high the tail could reach, and a calibrated density is what tells them.
 
 ![Coherent scenarios against independent marginals](reports/figures/readme_coherent_traces.png)
 
 Underneath that fan sit whole days. Both panels draw scenarios for one example
-day, its clock and weather features given but no outcome fixed. On the left the
-BSTS samples each line jointly across all 48 half hours, so every one is a
-physically plausible day. On the right is all LightGBM can offer: per-step
-quantiles with no joint law, so a path is stitched from an independent draw at each
-half hour and comes out jagged. The difference bites the moment a decision spans
-the whole day. Sum the 48 steps for the day's total energy and the coherent draws
-give it with an honest spread; the independent marginals add up half hours they
-have pretended are unrelated and badly understate it, and a step-to-step quantity
-like the ramp they cannot give at all. Whole-day decisions need the joint law,
-which is why the headline forecaster is Bayesian.
-[Notebook 06](notebooks/06_bayes_vs_lightgbm.ipynb) measures the gap.
+day, its clock and weather features given but no outcome fixed.
+
+- Left: the BSTS samples each line jointly across all 48 half hours, so every one
+  is a physically plausible day.
+- Right: all LightGBM can offer is per-step quantiles with no joint law, so a path
+  is stitched from an independent draw at each half hour and comes out jagged.
+
+The difference bites the moment a decision spans the whole day:
+
+- Sum the 48 steps for the day's total energy and the coherent draws give it with
+  an honest spread; the independent marginals add up half hours they have pretended
+  are unrelated and badly understate it.
+- A step-to-step quantity like the ramp the marginals cannot give at all.
+
+Whole-day decisions need the joint law, which is why the headline forecaster is
+Bayesian. [Notebook 06](notebooks/06_bayes_vs_lightgbm.ipynb) measures the gap.
 
 The raw material is three years of half-hourly NSW1 demand. Forecasts run 48 steps
 ahead, issued twice a day, scored on a season-blocked test set that covers every
-month of the evaluation year under the weather forecasts actually on hand the day
-before, with nothing allowed to peek at the future. The aim is a Bayesian
-forecaster that matches a strong classical baseline on raw accuracy and beats it
-where a probabilistic forecast should be judged (density quality, calibration,
-short-lead sharpness, coherent whole-day scenarios), and an honest account of what
-the Bayesian machinery brings and what it costs.
+month of the evaluation year under the weather forecasts on hand the day before,
+with nothing allowed to peek at the future.
+
+The aim is a Bayesian forecaster that at least matches a strong classical baseline
+on raw accuracy and beats it where a probabilistic forecast should be judged:
+
+- density quality
+- calibration
+- short-lead sharpness
+- coherent whole-day scenarios
+
+The project also keeps an honest account of what the Bayesian machinery brings and
+what it costs.
 
 ## The models
 
 | Model | Predictive form | Role |
 | --- | --- | --- |
 | Seasonal naive | Gaussian band from weekly-naive errors | the floor and the MASE base |
-| Dynamic harmonic regression + AR(1) errors | analytic Gaussian | classical baseline |
+| Dynamic harmonic regression + AR(2) errors | analytic Gaussian | classical baseline |
 | LightGBM, 15 quantile heads | regularised quantiles | industry benchmark |
 | BART, two heads (mean and log scale) | posterior predictive draws | Bayesian trees against LightGBM |
 | BSTS: regression with a heteroskedastic AR([1,2]) error | posterior predictive paths | the Bayesian forecaster |
 
-Every model reads one shared design matrix: local-clock seasonal harmonics,
-temperature, dew point, irradiance, degree days, demand lags and holidays. The
-tree models also get origin-anchored recency features (the last observed demand
-against its day-ago and week-ago values, the recent slope and curvature, and the
-lead time), which hand them the information the BSTS carries inside its AR error
-dynamics. That BSTS error is an AR([1,2]): the diagnostics show clear lag-2
-structure, and where an AR(1) error carries only the residual level forward, an
-AR(2) error carries a level and a slope, so the forecast near the origin tracks the
-day's momentum. The ARIMA, left to choose its order on validation, settles on
-AR(1), the extra lag not paying its way out of sample. The observation scale is
-heteroskedastic, growing and shrinking with the hour of day, as the EDA asks.
+Every model reads one shared design matrix:
+
+- local-clock seasonal harmonics
+- temperature, dew point and irradiance
+- degree days, a piecewise-linear temperature spline for the convex
+  demand-temperature response, and thermal-inertia degree days (trailing 24 and 48
+  hour averages)
+- demand lags and holidays
+
+On top of that shared design:
+
+- The tree models get origin-anchored recency features (last observed demand
+  against its day-ago and week-ago values, the recent slope and curvature, plus the
+  lead time), the information the BSTS carries inside its AR error dynamics.
+- The BSTS error is an AR([1,2]). An AR(1) error carries only the residual level
+  forward, an AR(2) carries a level and a slope, so the forecast near the origin
+  tracks the day's momentum. The ARIMA, choosing its own order on validation,
+  independently lands on AR(2) too, so the second lag is a real feature of the
+  residuals rather than a Bayesian artefact.
+- The observation scale is heteroskedastic, growing and shrinking with the hour of
+  day, as the EDA asks.
 
 ## How the project unfolds
 
@@ -99,23 +125,29 @@ The metrics that lead are the log score and calibration, not a single error
 number. On the test set, under archived forecast weather, averaged over all twelve
 evaluation months, from [notebook 05](notebooks/05_model_comparison.ipynb):
 
-| model | log score (nats) | 50% coverage | 90% coverage | CRPS (MW) |
+| model | log score (nats) | 50% coverage | 95% coverage | CRPS (MW) |
 | --- | --- | --- | --- | --- |
-| BSTS | 7.47 | 0.50 | 0.86 | 272 |
-| BART | 7.52 | 0.56 | 0.93 | 298 |
-| ARIMA AR(1) | 7.62 | 0.54 | 0.87 | 258 |
-| seasonal naive | 8.04 | 0.56 | 0.90 | 490 |
-| LightGBM | none (no density) | 0.36 | 0.77 | 200 |
+| BSTS | 7.38 | 0.54 | 0.91 | 248 |
+| BART | 7.48 | 0.59 | 0.98 | 283 |
+| ARIMA AR(2) | 7.63 | 0.61 | 0.91 | 270 |
+| seasonal naive | 8.04 | 0.56 | 0.94 | 490 |
+| LightGBM | none (no density) | 0.36 | 0.86 | 191 |
 
-The BSTS posts the best log score (7.47 against ARIMA's 7.62, paired bootstrap
-p < 0.001) and the best calibration, its 50 percent interval covering almost
-exactly 50 percent of outcomes. LightGBM takes the single-number
-CRPS by a wide margin (200 MW) but carries no density, so it has no log score, and
-its intervals are overconfident, the nominal 90 percent band catching only 77
-percent. ARIMA edges the BSTS on overall CRPS (258 against 272, p = 0.02) by
-winning the long horizon, while the BSTS is far sharper in the first hours (58
-against 83 MW at 30 minutes). The absolute scores run high because handling every
-season at once is hard; the ranking is the story.
+The BSTS posts the best log score in the field (7.38 against ARIMA's 7.63 and
+BART's 7.48) and the best calibration, its 50 percent interval covering 54 percent
+of outcomes.
+
+- It now also beats ARIMA on CRPS at every lead (248 against 270, paired bootstrap
+  p < 0.001) and takes the energy score over whole paths (2232 against 2316).
+- LightGBM still wins the single-number CRPS by a clear margin (191 MW), but it
+  carries no density, so no log score, and its intervals are overconfident: the
+  nominal 95 percent band catches 86 percent and the 50 percent band only 36.
+- The BSTS is the sharpest in the field through the first two hours (74 against
+  LightGBM's 159 MW at 30 minutes) before the flexible tree mean pulls ahead at
+  longer lead.
+
+The absolute scores run high because handling every season at once is hard. The
+ranking is the story.
 
 ![CRPS by lead time](reports/figures/horizon_crps_all_models.png)
 
@@ -170,11 +202,12 @@ python scripts/fit_bsts_innovations.py # the BSTS: ADVI + NUTS
 Or chain every fit and then execute every notebook in order with
 `bash scripts/run_all.sh` (pass `fits` or `notebooks` to run a single stage).
 
-The processed panel and split labels are committed, so the fit scripts and
-notebooks run with no downloads. JAX picks up a CUDA GPU automatically
-(`pip install "jax[cuda12]"`); the BSTS likelihood is pure matrix arithmetic, so it
-runs fastest there, and the notebooks report timings for both devices. `pytest` and
-`ruff` run in CI on every push.
+- The processed panel and split labels are committed, so the fit scripts and
+  notebooks run with no downloads.
+- JAX picks up a CUDA GPU automatically (`pip install "jax[cuda12]"`); the BSTS
+  likelihood is pure matrix arithmetic, so it runs fastest there, and the notebooks
+  report timings for both devices.
+- `pytest` and `ruff` run in CI on every push.
 
 ## Data licences and attribution
 

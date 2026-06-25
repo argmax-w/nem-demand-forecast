@@ -68,6 +68,11 @@ class WeatherConfig:
     heating_base: float
     cooling_base: float
     eda_variables: tuple[str, ...] = ()
+    # Hinge knots (degrees C) for the piecewise-linear temperature spline, and
+    # trailing windows (half-hour steps) for the thermal-inertia degree-days.
+    # Both are validation-selected; empty disables them.
+    temperature_spline_knots: tuple[float, ...] = ()
+    thermal_windows: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -263,6 +268,10 @@ def load_config(path: str | Path | None = None) -> Config:
             heating_base=float(raw["weather"]["heating_base"]),
             cooling_base=float(raw["weather"]["cooling_base"]),
             eda_variables=tuple(raw["weather"].get("eda_variables", ())),
+            temperature_spline_knots=tuple(
+                float(k) for k in raw["weather"].get("temperature_spline_knots", ())
+            ),
+            thermal_windows=tuple(int(w) for w in raw["weather"].get("thermal_windows", ())),
         ),
         features=FeatureConfig(
             seasonal_basis=raw["features"]["seasonal_basis"],

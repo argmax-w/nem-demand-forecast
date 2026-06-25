@@ -100,7 +100,7 @@ def main() -> None:
         if sidecar_only:
             return {}
         with timed("predict_seconds", timings):
-            variants, y_true = predict_variants_innovations(
+            variants, y_true, moments = predict_variants_innovations(
                 {name: jnp.asarray(value) for name, value in draws.items()},
                 inputs,
                 panel,
@@ -111,6 +111,7 @@ def main() -> None:
         arrays = {"origins_test": test_origins.asi8, "y_test": y_true}
         for name, paths in variants.items():
             arrays[f"{name}_paths"] = paths
+        arrays.update(moments)  # forecast_path_mean, forecast_path_sd for Rao-Blackwellisation
         gates.check_forecast(samples=arrays["forecast_paths"])  # withhold nonsense
         return arrays
 

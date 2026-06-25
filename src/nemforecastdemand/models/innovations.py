@@ -108,9 +108,7 @@ def innovations_model(
     numpyro.sample(
         "e1", dist.Normal(lag1_corr * e[0], sd0 * jnp.sqrt(1.0 - lag1_corr**2)), obs=e[1]
     )
-    numpyro.sample(
-        "innovations", dist.Normal(rho1 * e[1:-1] + rho2 * e[:-2], sigma[2:]), obs=e[2:]
-    )
+    numpyro.sample("innovations", dist.Normal(rho1 * e[1:-1] + rho2 * e[:-2], sigma[2:]), obs=e[2:])
 
 
 def _scales_and_regression(
@@ -245,6 +243,53 @@ def simulate_horizon_paths(
         key = jax.random.PRNGKey(seed + i)
         blocks.append(np.asarray(chunk_fn(block, e_origin[i : i + chunk], key), dtype=np.float32))
     return np.concatenate(blocks, axis=0)
+
+
+def horizon_path_moments(
+    draws: dict[str, jnp.ndarray],
+    e_origin: jnp.ndarray,
+    x_future: np.ndarray,
+    xv_future: np.ndarray,
+    bsts: BstsConfig,
+    chunk: int = 200,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-draw Gaussian predictive moments for every origin and step.
+
+    Conditional on one draw the h-step predictive is Gaussian with mean
+    ``x'beta + A_h e_last + B_h e_prev`` and variance ``sum_j psi_{h-j}^2
+    sigma_j^2``. Returning the moments per draw, rather than reducing them as
+    :func:`decompose_horizon_variance` does, is what lets the predictive be
+    Rao-Blackwellised downstream: the density, bands, PIT and log score then
+    average analytic Gaussians over draws instead of histogramming sampled
+    paths.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Per-draw mean and standard deviation, each ``(S, O, H)`` in
+        standardised units, float32.
+    """
+    horizon = x_future.shape[1]
+    x_future = jnp.asarray(x_future)
+    xv_future = jnp.asarray(xv_future)
+
+    def one_chunk(block: dict[str, jnp.ndarray], e_block: jnp.ndarray):
+        rho1, rho2 = _ar2_coeffs(block)
+        regression, sigma = _scales_and_regression(block, x_future, xv_future, bsts.heteroskedastic)
+        A, B, W = _ar2_weights(rho1, rho2, horizon)
+        carry = _ar2_carry(A, B, e_block)
+        conditional_var = jnp.einsum("shj,soj->soh", W**2, sigma**2)
+        return regression + carry, jnp.sqrt(conditional_var)
+
+    chunk_fn = jax.jit(one_chunk)
+    n_draws = e_origin.shape[0]
+    means, sds = [], []
+    for i in range(0, n_draws, chunk):
+        block = {name: jnp.asarray(value[i : i + chunk]) for name, value in draws.items()}
+        mu, sd = chunk_fn(block, e_origin[i : i + chunk])
+        means.append(np.asarray(mu, dtype=np.float32))
+        sds.append(np.asarray(sd, dtype=np.float32))
+    return np.concatenate(means, axis=0), np.concatenate(sds, axis=0)
 
 
 def decompose_horizon_variance(

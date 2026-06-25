@@ -147,3 +147,25 @@ def test_components_sum_to_simulated_path_variance(cfg_bsts):
     )
     simulated = paths.astype(np.float64).var(axis=0)
     np.testing.assert_allclose(total, simulated, rtol=0.1)
+
+
+def test_path_moments_reduce_to_variance_decomposition(cfg_bsts):
+    # The per-draw moments must reduce exactly to the two-part variance
+    # decomposition: variance across draws of the conditional mean is the
+    # parameter component, and the mean across draws of the conditional
+    # variance is the innovation component.
+    draws = make_draws(4000, 3, 2, spread=1.0, seed=11)
+    y, x, _ = synthetic_history()
+    x_future, z_future = horizon_designs(2)
+    positions = np.array([150, 180])
+    e_origin = innovations.origin_residuals(draws, y, x, positions)
+
+    mean, sd = innovations.horizon_path_moments(draws, e_origin, x_future, z_future, cfg_bsts)
+    assert mean.shape == (4000, 2, HORIZON)
+    assert sd.shape == (4000, 2, HORIZON)
+
+    parts = innovations.decompose_horizon_variance(draws, e_origin, x_future, z_future, cfg_bsts)
+    np.testing.assert_allclose(mean.astype(np.float64).var(axis=0), parts["parameter"], rtol=2e-3)
+    np.testing.assert_allclose(
+        (sd.astype(np.float64) ** 2).mean(axis=0), parts["innovation"], rtol=2e-3
+    )
